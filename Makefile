@@ -112,7 +112,23 @@ endif
 endif
 endif
 
-VMCINFO_CC ?= $(CC)
+ifeq ($(origin CC), command line)
+VMCINFO_CC := $(CC)
+else ifeq ($(UNAME_S),Darwin)
+LLVM_PREFIX := $(shell brew --prefix llvm 2>/dev/null)
+ifneq ($(LLVM_PREFIX),)
+ifneq ($(wildcard $(LLVM_PREFIX)/bin/clang),)
+VMCINFO_CC := $(LLVM_PREFIX)/bin/clang
+else
+VMCINFO_CC := /usr/bin/clang
+endif
+else
+VMCINFO_CC := /usr/bin/clang
+endif
+else
+VMCINFO_CC := gcc
+endif
+
 VMCINFO_CFLAGS ?= -O2 -Wall -Wextra
 VMCINFO_CPPFLAGS ?=
 VMCINFO_LDFLAGS ?=

@@ -11,6 +11,15 @@
 #define VMC_PS1_SIGNATURE_PRESENT         1
 #define VMC_PS1_SIGNATURE_MISSING_BLANK   2
 #define VMC_PS1_SIGNATURE_MISSING_UNKNOWN 3
+#define VMC_PS1_SIGNATURE_ENCRYPTED       4
+
+typedef struct pfs_sealedkey_info {
+	int valid;
+	uint16_t keyset;
+	uint8_t iv[16];
+	uint8_t enc_key[32];
+	uint8_t hmac[32];
+} pfs_sealedkey_info_t;
 
 typedef struct vmc_info {
 	int system;
@@ -26,12 +35,15 @@ typedef struct vmc_info {
 	int has_ecc;
 	int ps1_signature;
 	int signature_present;
+	int slot_payload_suspect_encrypted;
 	const char* format;
 	const char* container;
+	char sealedkey_path[256];
 } vmc_info_t;
 
 int vmc_get_info(const char* path, vmc_info_t* info);
 int vmc_get_info_slot(const char* path, vmc_info_t* info, uint32_t slot);
 const char* vmc_system_name(int system);
+int pfs_parse_sealedkey(const char* path, pfs_sealedkey_info_t* out);
 
 #endif

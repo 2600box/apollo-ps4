@@ -13,6 +13,18 @@
 #define PS1_EMBED_SCAN_LIMIT (16 * 1024 * 1024)
 #define PS1_EMBED_SCAN_CHUNK (64 * 1024)
 
+static void vmc_info_init(vmc_info_t* info)
+{
+	if (!info)
+		return;
+
+	memset(info, 0, sizeof(*info));
+	info->format = "Unknown";
+	info->ps1_signature = VMC_PS1_SIGNATURE_NA;
+	info->signature_present = 0;
+	info->container = NULL;
+}
+
 static uint16_t read_le16(const uint8_t* ptr)
 {
 	return (uint16_t) ptr[0] | ((uint16_t) ptr[1] << 8);
@@ -21,6 +33,53 @@ static uint16_t read_le16(const uint8_t* ptr)
 static uint32_t read_le32(const uint8_t* ptr)
 {
 	return (uint32_t) ptr[0] | ((uint32_t) ptr[1] << 8) | ((uint32_t) ptr[2] << 16) | ((uint32_t) ptr[3] << 24);
+}
+
+int pfs_parse_sealedkey(const char* path, pfs_sealedkey_info_t* out)
+{
+	uint8_t data[96];
+	FILE* fp;
+	long size;
+
+	if (!path || !out)
+		return 0;
+
+	memset(out, 0, sizeof(*out));
+
+	fp = fopen(path, "rb");
+	if (!fp)
+		return 0;
+
+	if (fseeko(fp, 0, SEEK_END) < 0)
+	{
+		fclose(fp);
+		return 0;
+	}
+
+	size = ftello(fp);
+	if (size != (long) sizeof(data) || fseeko(fp, 0, SEEK_SET) < 0)
+	{
+		fclose(fp);
+		return 0;
+	}
+
+	if (fread(data, 1, sizeof(data), fp) != sizeof(data))
+	{
+		fclose(fp);
+		return 0;
+	}
+
+	fclose(fp);
+
+	if (memcmp(data, "pfsSKKey", 8) != 0)
+		return 0;
+
+	out->keyset = read_le16(data + 0x08);
+	memcpy(out->iv, data + 0x10, sizeof(out->iv));
+	memcpy(out->enc_key, data + 0x20, sizeof(out->enc_key));
+	memcpy(out->hmac, data + 0x40, sizeof(out->hmac));
+	out->valid = 1;
+	return 1;
 }
 
 static int is_ps1_headered_size(uint64_t size)
@@ -191,6 +250,108 @@ static void fill_ps1hd_slot_info(FILE* fp, vmc_info_t* info, uint32_t slot)
 		info->signature_present = 0;
 		info->ps1_signature = VMC_PS1_SIGNATURE_MISSING_UNKNOWN;
 	}
+}
+
+static int slot_looks_high_entropy(FILE* fp, uint64_t off)
+{
+	uint8_t block[4096];
+	uint32_t hist[256] = {0};
+	size_t i;
+	unsigned distinct = 0;
+	unsigned zeros_or_ff = 0;
+
+	if (!fp)
+		return 0;
+
+	if (fseeko(fp, (off_t) off, SEEK_SET) < 0)
+		return 0;
+
+	if (fread(block, 1, sizeof(block), fp) != sizeof(block))
+		return 0;
+
+	for (i = 0; i < sizeof(block); i++)
+	{
+		hist[block[i]]++;
+		if (block[i] == 0x00 || block[i] == 0xFF)
+			zeros_or_ff++;
+	}
+
+	for (i = 0; i < 256; i++)
+	{
+		if (hist[i] != 0)
+			distinct++;
+	}
+
+	if (distinct > 200 && zeros_or_ff * 50 < sizeof(block))
+		return 1;
+
+	return 0;
+}
+
+static int has_suffix(const char* path, const char* suffix)
+{
+	size_t path_len;
+	size_t suffix_len;
+
+	if (!path || !suffix)
+		return 0;
+
+	path_len = strlen(path);
+	suffix_len = strlen(suffix);
+	if (path_len < suffix_len)
+		return 0;
+
+	return (strcmp(path + path_len - suffix_len, suffix) == 0);
+}
+
+static int make_bin_candidate(char* out, size_t out_size, const char* base)
+{
+	size_t base_len;
+
+	if (!out || !base || out_size == 0)
+		return 0;
+
+	base_len = strlen(base);
+	if (base_len + 4 >= out_size)
+		return 0;
+
+	memcpy(out, base, base_len);
+	memcpy(out + base_len, ".bin", 5);
+	return 1;
+}
+
+static void detect_companion_sealedkey(const char* path, vmc_info_t* info)
+{
+	char candidate[256];
+	char no_ext[256];
+	const char* slash;
+	const char* dot;
+	pfs_sealedkey_info_t sk;
+
+	if (!path || !info)
+		return;
+
+	if (!(has_suffix(path, ".VMC") || has_suffix(path, ".vmc")))
+		return;
+
+	slash = strrchr(path, '/');
+	dot = strrchr(path, '.');
+	if (dot && (!slash || dot > slash))
+	{
+		size_t n = (size_t) (dot - path);
+		if (n >= sizeof(no_ext))
+			n = sizeof(no_ext) - 1;
+		memcpy(no_ext, path, n);
+		no_ext[n] = '\0';
+		if (make_bin_candidate(candidate, sizeof(candidate), no_ext) && pfs_parse_sealedkey(candidate, &sk) && sk.valid)
+		{
+			snprintf(info->sealedkey_path, sizeof(info->sealedkey_path), "%s", candidate);
+			return;
+		}
+	}
+
+	if (make_bin_candidate(candidate, sizeof(candidate), path) && pfs_parse_sealedkey(candidate, &sk) && sk.valid)
+		snprintf(info->sealedkey_path, sizeof(info->sealedkey_path), "%s", candidate);
 }
 
 static int validate_embedded_ps1_signature(FILE* fp, uint64_t file_size, uint64_t sig_offset)
@@ -367,11 +528,7 @@ int vmc_get_info_slot(const char* path, vmc_info_t* info, uint32_t slot)
 	if (!path || !info)
 		return 0;
 
-	memset(info, 0, sizeof(*info));
-	info->format = "Unknown";
-	info->ps1_signature = VMC_PS1_SIGNATURE_NA;
-	info->signature_present = 0;
-	info->container = NULL;
+	vmc_info_init(info);
 
 	fp = fopen(path, "rb");
 	if (!fp)
@@ -467,5 +624,130 @@ int vmc_get_info_slot(const char* path, vmc_info_t* info, uint32_t slot)
 
 int vmc_get_info(const char* path, vmc_info_t* info)
 {
-	return vmc_get_info_slot(path, info, 0);
+	uint8_t hdr[0x200] = {0};
+	FILE* fp;
+	size_t n;
+
+	if (!path || !info)
+		return 0;
+
+	vmc_info_init(info);
+
+	fp = fopen(path, "rb");
+	if (!fp)
+		return 0;
+
+	if (fseeko(fp, 0, SEEK_END) < 0)
+	{
+		fclose(fp);
+		return 0;
+	}
+
+	info->file_size = (uint64_t) ftello(fp);
+	if (fseeko(fp, 0, SEEK_SET) < 0)
+	{
+		fclose(fp);
+		return 0;
+	}
+
+	n = fread(hdr, 1, sizeof(hdr), fp);
+	if (n < 0x90)
+	{
+		fclose(fp);
+		return 0;
+	}
+
+	if (!memcmp(hdr, PS2_MAGIC, sizeof(PS2_MAGIC) - 1))
+	{
+		uint64_t raw_size;
+
+		info->system = VMC_SYSTEM_PS2;
+		info->format = "PS2 VMC";
+		info->pagesize = read_le16(hdr + 0x28);
+		info->pages_per_cluster = read_le16(hdr + 0x2A);
+		info->clusters_per_card = read_le32(hdr + 0x30);
+
+		raw_size = (uint64_t) info->pagesize * info->pages_per_cluster * info->clusters_per_card;
+		if (raw_size > UINT32_MAX)
+		{
+			fclose(fp);
+			return 0;
+		}
+
+		info->raw_size = (uint32_t) raw_size;
+		if (raw_size > 0 && info->file_size == raw_size + (raw_size / 32))
+			info->has_ecc = 1;
+		fclose(fp);
+		return 1;
+	}
+
+	if (detect_ps1_vmc(fp, hdr, n, info->file_size, info))
+	{
+		info->signature_present = (info->ps1_signature == VMC_PS1_SIGNATURE_PRESENT) ? 1 : 0;
+		fclose(fp);
+		return 1;
+	}
+
+	if (detect_ps1hd_vmc_container(hdr, n, info->file_size, info))
+	{
+		uint32_t sample_slots = info->embedded_slots;
+
+		fill_ps1hd_slot_info(fp, info, 0);
+		uint32_t i;
+		uint32_t missing_count = 0;
+		uint32_t high_entropy_count = 0;
+
+		if (sample_slots > 26)
+			sample_slots = 26;
+
+		for (i = 0; i < sample_slots; i++)
+		{
+			uint64_t slot_offset = PS1HD_HDR_SIZE + ((uint64_t) i * PS1CARD_RAW_SIZE);
+			int signature_present =
+				read_ps1_signature_at(fp, info->file_size, slot_offset) ||
+				read_ps1_signature_at(fp, info->file_size, slot_offset + 0x80);
+
+			if (!signature_present)
+			{
+				missing_count++;
+				if (slot_looks_high_entropy(fp, slot_offset))
+					high_entropy_count++;
+			}
+		}
+
+		if (sample_slots > 0 && missing_count == sample_slots && high_entropy_count >= (sample_slots * 3 / 4))
+		{
+			info->slot_payload_suspect_encrypted = 1;
+			info->ps1_signature = VMC_PS1_SIGNATURE_ENCRYPTED;
+			info->container = "PS1HD VMC container (payload appears encrypted/protected)";
+		}
+		else
+		{
+			info->container = "PS1HD VMC container";
+		}
+
+		detect_companion_sealedkey(path, info);
+		fclose(fp);
+		return 1;
+	}
+
+	{
+		uint64_t embedded_offset;
+
+		if (find_embedded_ps1_raw(fp, info->file_size, &embedded_offset))
+		{
+			info->system = VMC_SYSTEM_PS1;
+			info->format = "PS1 Memory Card";
+			info->container = "Embedded/Container VMC";
+			info->raw_size = PS1CARD_RAW_SIZE;
+			info->embedded_offset = embedded_offset;
+			info->embedded_size = PS1CARD_RAW_SIZE;
+			info->ps1_signature = VMC_PS1_SIGNATURE_PRESENT;
+			fclose(fp);
+			return 1;
+		}
+	}
+
+	fclose(fp);
+	return 0;
 }

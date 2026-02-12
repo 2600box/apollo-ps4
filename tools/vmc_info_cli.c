@@ -12,7 +12,7 @@
 
 static void print_usage(const char* argv0)
 {
-	fprintf(stderr, "Usage: %s [--slot N] <memory-card.vmc> [more.vmc ...]\n", argv0);
+	fprintf(stderr, "Usage: %s [--slot N] [--sealedkey PATH] <memory-card.vmc> [more...]\n", argv0);
 }
 
 static void print_ps1_signature(const vmc_info_t* info)
@@ -28,12 +28,15 @@ static void print_ps1_signature(const vmc_info_t* info)
 		case VMC_PS1_SIGNATURE_MISSING_UNKNOWN:
 			printf("Signature: missing\n");
 			break;
+		case VMC_PS1_SIGNATURE_ENCRYPTED:
+			printf("Signature: missing (payload appears encrypted/protected; PS1 'MC' header not visible)\n");
+			break;
 		default:
 			break;
 	}
 }
 
-static int print_slot_summary(const char* path, uint32_t slots)
+static int print_slot_summary(const char* path, uint32_t slots, int encrypted)
 {
 	uint32_t i;
 	uint32_t limit = slots;
@@ -55,7 +58,10 @@ static int print_slot_summary(const char* path, uint32_t slots)
 			continue;
 		}
 
-		printf("slot %u: signature %s\n", i, slot_info.signature_present ? "present" : "missing");
+		if (!slot_info.signature_present && encrypted)
+			printf("slot %u: signature missing (high entropy)\n", i);
+		else
+			printf("slot %u: signature %s\n", i, slot_info.signature_present ? "present" : "missing");
 	}
 
 	if (slots > limit)
@@ -64,9 +70,12 @@ static int print_slot_summary(const char* path, uint32_t slots)
 	return 0;
 }
 
-static int print_vmc_info(const char* path, int has_slot, uint32_t slot)
+static int print_vmc_info(const char* path, int has_slot, uint32_t slot, const char* sealedkey_override)
 {
 	vmc_info_t info;
+	pfs_sealedkey_info_t sk_info;
+	int sealedkey_valid = 0;
+	const char* sealedkey_path = NULL;
 
 	if ((has_slot && !vmc_get_info_slot(path, &info, slot)) || (!has_slot && !vmc_get_info(path, &info)))
 	{
@@ -92,14 +101,17 @@ static int print_vmc_info(const char* path, int has_slot, uint32_t slot)
 		printf("Raw size: %u bytes\n", info.raw_size);
 
 		if (!has_slot && info.embedded_slots > 0)
-			print_slot_summary(path, info.embedded_slots);
+			print_slot_summary(path, info.embedded_slots, info.slot_payload_suspect_encrypted);
 
 		if (info.embedded_slots > 0)
 		{
 			printf("Embedded slot: %u / %u\n", info.embedded_slot, info.embedded_slots - 1);
 			printf("Embedded offset: %" PRIu64 " (0x%" PRIx64 ")\n", info.embedded_offset, info.embedded_offset);
 			printf("Embedded size: %u bytes\n", info.embedded_size);
-			printf("Signature: %s\n", info.signature_present ? "present" : "missing");
+			if (info.slot_payload_suspect_encrypted)
+				printf("Signature: missing (payload appears encrypted/protected; PS1 'MC' header not visible)\n");
+			else
+				printf("Signature: %s\n", info.signature_present ? "present" : "missing");
 		}
 		else
 		{
@@ -108,6 +120,27 @@ static int print_vmc_info(const char* path, int has_slot, uint32_t slot)
 
 		if (info.container)
 			printf("Container: %s\n", info.container);
+
+		if (sealedkey_override)
+			sealedkey_path = sealedkey_override;
+		else if (info.sealedkey_path[0] != '\0')
+			sealedkey_path = info.sealedkey_path;
+
+		if (sealedkey_path)
+		{
+			if (pfs_parse_sealedkey(sealedkey_path, &sk_info) && sk_info.valid)
+				sealedkey_valid = 1;
+
+			if (sealedkey_valid)
+			{
+				printf("Sealed key: present (pfsSKKey, 96 bytes) [%s]\n", sealedkey_path);
+				printf("Keyset: %u\n", sk_info.keyset);
+			}
+			else if (sealedkey_override)
+			{
+				printf("Sealed key: invalid (expected 96 bytes + magic pfsSKKey)\n");
+			}
+		}
 	}
 
 	puts("");
@@ -121,6 +154,7 @@ int main(int argc, char** argv)
 	int argi = 1;
 	int has_slot = 0;
 	uint32_t slot = 0;
+	const char* sealedkey_override = NULL;
 
 	if (argc < 2)
 	{
@@ -128,27 +162,52 @@ int main(int argc, char** argv)
 		return 1;
 	}
 
-	if (argi < argc && strcmp(argv[argi], "--slot") == 0)
+	while (argi < argc)
 	{
-		char* end;
-		unsigned long parsed;
+		if (strcmp(argv[argi], "--slot") == 0)
+		{
+			char* end;
+			unsigned long parsed;
 
-		if (argi + 2 >= argc)
+			if (argi + 2 >= argc)
+			{
+				print_usage(argv[0]);
+				return 1;
+			}
+
+			parsed = strtoul(argv[argi + 1], &end, 10);
+			if (*argv[argi + 1] == '\0' || *end != '\0' || parsed > UINT32_MAX)
+			{
+				fprintf(stderr, "Invalid slot value: %s\n", argv[argi + 1]);
+				return 1;
+			}
+
+			slot = (uint32_t) parsed;
+			has_slot = 1;
+			argi += 2;
+			continue;
+		}
+
+		if (strcmp(argv[argi], "--sealedkey") == 0)
+		{
+			if (argi + 2 >= argc)
+			{
+				print_usage(argv[0]);
+				return 1;
+			}
+
+			sealedkey_override = argv[argi + 1];
+			argi += 2;
+			continue;
+		}
+
+		if (strncmp(argv[argi], "--", 2) == 0)
 		{
 			print_usage(argv[0]);
 			return 1;
 		}
 
-		parsed = strtoul(argv[argi + 1], &end, 10);
-		if (*argv[argi + 1] == '\0' || *end != '\0' || parsed > UINT32_MAX)
-		{
-			fprintf(stderr, "Invalid slot value: %s\n", argv[argi + 1]);
-			return 1;
-		}
-
-		slot = (uint32_t) parsed;
-		has_slot = 1;
-		argi += 2;
+		break;
 	}
 
 	if (argi >= argc)
@@ -158,7 +217,7 @@ int main(int argc, char** argv)
 	}
 
 	for (i = argi; i < argc; i++)
-		failed |= print_vmc_info(argv[i], has_slot, slot);
+		failed |= print_vmc_info(argv[i], has_slot, slot, sealedkey_override);
 
 	return failed ? 2 : 0;
 }

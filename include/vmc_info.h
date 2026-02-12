@@ -18,16 +18,20 @@ typedef struct vmc_info {
 	uint32_t raw_size;
 	uint64_t embedded_offset;
 	uint32_t embedded_size;
+	uint32_t embedded_slots;
+	uint32_t embedded_slot;
 	uint32_t pagesize;
 	uint32_t pages_per_cluster;
 	uint32_t clusters_per_card;
 	int has_ecc;
 	int ps1_signature;
+	int signature_present;
 	const char* format;
 	const char* container;
 } vmc_info_t;
 
 int vmc_get_info(const char* path, vmc_info_t* info);
+int vmc_get_info_slot(const char* path, vmc_info_t* info, uint32_t slot);
 const char* vmc_system_name(int system);
 
 #endif

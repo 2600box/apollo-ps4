@@ -6,6 +6,8 @@
 #include "vmc_info.h"
 
 #define PS1CARD_RAW_SIZE 131072
+#define PS1HD_HDR_SIZE 0x8000
+#define PS1HD_SLOT_SANITY_CAP 128
 #define PS2_MAGIC "Sony PS2 Memory Card Format "
 #define PS1_BLANK_CHECK_SIZE 4096
 #define PS1_EMBED_SCAN_LIMIT (16 * 1024 * 1024)
@@ -114,7 +116,7 @@ static int detect_ps1hd_vmc_container(const uint8_t* hdr, size_t hdr_size, uint6
 	if (!hdr || !info)
 		return 0;
 
-	if (hdr_size < 0x2C || size <= PS1CARD_RAW_SIZE)
+	if (hdr_size < 0x2C || size <= PS1HD_HDR_SIZE)
 		return 0;
 
 	/*
@@ -122,16 +124,73 @@ static int detect_ps1hd_vmc_container(const uint8_t* hdr, size_t hdr_size, uint6
 	 * container header and don't expose the raw "MC" signature at file offset 0.
 	 * We identify this wrapper using its stable header fields.
 	 */
-	if (read_le32(hdr + 0x00) == 1 && read_le32(hdr + 0x20) == 0x8000 && read_le32(hdr + 0x24) == 1 && read_le32(hdr + 0x28) == 1)
+	if (read_le32(hdr + 0x00) == 1 && read_le32(hdr + 0x20) == PS1HD_HDR_SIZE && read_le32(hdr + 0x24) == 1 && read_le32(hdr + 0x28) == 1)
 	{
+		uint64_t payload_size;
+		uint64_t slots;
+
+		if ((size - PS1HD_HDR_SIZE) % PS1CARD_RAW_SIZE != 0)
+			return 0;
+
+		payload_size = size - PS1HD_HDR_SIZE;
+		slots = payload_size / PS1CARD_RAW_SIZE;
+		if (slots == 0 || slots > PS1HD_SLOT_SANITY_CAP)
+			return 0;
+
 		info->system = VMC_SYSTEM_PS1;
 		info->raw_size = PS1CARD_RAW_SIZE;
 		info->ps1_signature = VMC_PS1_SIGNATURE_MISSING_UNKNOWN;
+		info->embedded_slots = (uint32_t) slots;
 		info->format = "PS1HD VMC container";
 		return 1;
 	}
 
 	return 0;
+}
+
+static int read_ps1_signature_at(FILE* fp, uint64_t file_size, uint64_t offset)
+{
+	uint8_t sig[2];
+
+	if (!fp || offset + sizeof(sig) > file_size)
+		return 0;
+
+	if (fseeko(fp, (off_t) offset, SEEK_SET) < 0)
+		return 0;
+
+	if (fread(sig, 1, sizeof(sig), fp) != sizeof(sig))
+		return 0;
+
+	return (sig[0] == 'M' && sig[1] == 'C');
+}
+
+static void fill_ps1hd_slot_info(FILE* fp, vmc_info_t* info, uint32_t slot)
+{
+	uint64_t slot_offset;
+	int sig_at_start;
+	int sig_at_80;
+
+	if (!info)
+		return;
+
+	info->embedded_slot = slot;
+	slot_offset = PS1HD_HDR_SIZE + ((uint64_t) slot * PS1CARD_RAW_SIZE);
+	info->embedded_offset = slot_offset;
+	info->embedded_size = PS1CARD_RAW_SIZE;
+
+	sig_at_start = read_ps1_signature_at(fp, info->file_size, slot_offset);
+	sig_at_80 = read_ps1_signature_at(fp, info->file_size, slot_offset + 0x80);
+
+	if (sig_at_start || sig_at_80)
+	{
+		info->signature_present = 1;
+		info->ps1_signature = VMC_PS1_SIGNATURE_PRESENT;
+	}
+	else
+	{
+		info->signature_present = 0;
+		info->ps1_signature = VMC_PS1_SIGNATURE_MISSING_UNKNOWN;
+	}
 }
 
 static int validate_embedded_ps1_signature(FILE* fp, uint64_t file_size, uint64_t sig_offset)
@@ -299,7 +358,7 @@ const char* vmc_system_name(int system)
 	}
 }
 
-int vmc_get_info(const char* path, vmc_info_t* info)
+int vmc_get_info_slot(const char* path, vmc_info_t* info, uint32_t slot)
 {
 	uint8_t hdr[0x200] = {0};
 	FILE* fp;
@@ -311,6 +370,7 @@ int vmc_get_info(const char* path, vmc_info_t* info)
 	memset(info, 0, sizeof(*info));
 	info->format = "Unknown";
 	info->ps1_signature = VMC_PS1_SIGNATURE_NA;
+	info->signature_present = 0;
 	info->container = NULL;
 
 	fp = fopen(path, "rb");
@@ -364,6 +424,20 @@ int vmc_get_info(const char* path, vmc_info_t* info)
 
 	if (detect_ps1_vmc(fp, hdr, n, info->file_size, info))
 	{
+		info->signature_present = (info->ps1_signature == VMC_PS1_SIGNATURE_PRESENT) ? 1 : 0;
+		fclose(fp);
+		return 1;
+	}
+
+	if (detect_ps1hd_vmc_container(hdr, n, info->file_size, info))
+	{
+		if (slot >= info->embedded_slots)
+		{
+			fclose(fp);
+			return 0;
+		}
+
+		fill_ps1hd_slot_info(fp, info, slot);
 		fclose(fp);
 		return 1;
 	}
@@ -386,13 +460,12 @@ int vmc_get_info(const char* path, vmc_info_t* info)
 		}
 	}
 
-	if (detect_ps1hd_vmc_container(hdr, n, info->file_size, info))
-	{
-		fclose(fp);
-		return 1;
-	}
-
 	fclose(fp);
 
 	return 0;
+}
+
+int vmc_get_info(const char* path, vmc_info_t* info)
+{
+	return vmc_get_info_slot(path, info, 0);
 }

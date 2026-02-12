@@ -2,6 +2,7 @@
 #define __VMC_INFO_H__
 
 #include <stdint.h>
+#include <stddef.h>
 
 #define VMC_SYSTEM_UNKNOWN 0
 #define VMC_SYSTEM_PS1     1
@@ -43,6 +44,8 @@ typedef struct vmc_info {
 
 int vmc_get_info(const char* path, vmc_info_t* info);
 int vmc_get_info_slot(const char* path, vmc_info_t* info, uint32_t slot);
+int vmc_read_embedded_slot(const char* path, uint32_t slot, uint8_t* buf, size_t buf_len);
+int vmc_dump_embedded_slot(const char* path, uint32_t slot, const char* outfile);
 const char* vmc_system_name(int system);
 int pfs_parse_sealedkey(const char* path, pfs_sealedkey_info_t* out);
 

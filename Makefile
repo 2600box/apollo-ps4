@@ -99,9 +99,30 @@ createzip: ## Download the latest appdata.zip cheat pack.
 	@rm -fr assets/misc/appdata.zip
 	@curl -L "https://bucanero.github.io/apollo-patches/PS4/apollo-ps4-update.zip" > assets/misc/appdata.zip
 
+OPENSSL_CFLAGS := $(shell pkg-config --cflags openssl 2>/dev/null)
+OPENSSL_LIBS := $(shell pkg-config --libs openssl 2>/dev/null)
+
+ifeq ($(strip $(OPENSSL_CFLAGS)$(OPENSSL_LIBS)),)
+ifeq ($(UNAME_S),Darwin)
+BREW_OPENSSL := $(shell brew --prefix openssl@3 2>/dev/null)
+ifneq ($(strip $(BREW_OPENSSL)),)
+OPENSSL_CFLAGS := -I$(BREW_OPENSSL)/include
+OPENSSL_LIBS := -L$(BREW_OPENSSL)/lib -lcrypto
+endif
+endif
+endif
+
+VMCINFO_CC ?= $(CC)
+VMCINFO_CFLAGS ?= -O2 -Wall -Wextra
+VMCINFO_CPPFLAGS ?=
+VMCINFO_LDFLAGS ?=
+VMCINFO_LDLIBS ?=
+
 
 vmcinfo: ## Build the Linux VMC info CLI utility (amd64).
-	gcc -O2 -Wall -Wextra -Iinclude -o tools/vmcinfo tools/vmc_info_cli.c source/vmc_info.c -lcrypto
+	$(VMCINFO_CC) $(VMCINFO_CFLAGS) $(VMCINFO_CPPFLAGS) $(OPENSSL_CFLAGS) -Iinclude -o tools/vmcinfo tools/vmc_info_cli.c source/vmc_info.c $(VMCINFO_LDFLAGS) $(OPENSSL_LIBS) $(VMCINFO_LDLIBS)
+
+.PHONY: vmcinfo
 
 help: ## Display this help message.
 	@echo "Usage: make [target]"

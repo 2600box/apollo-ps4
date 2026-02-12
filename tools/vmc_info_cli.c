@@ -21,12 +21,16 @@
 static void print_usage(const char* argv0)
 {
 	fprintf(stderr, "Usage: %s [--slot N] [--list-slots] [--fingerprint] [--dump-slot N OUTFILE] [--decrypt OUTFILE] [--sealedkey PATH] [--rawkey PATH] <memory-card.vmc> [more...]\n", argv0);
+	fprintf(stderr, "  --slot N            Target embedded slot N for slot-dependent operations (including --decrypt).\n");
+	fprintf(stderr, "  --dump-slot N FILE  Dump embedded slot N; writes FILE only when valid .mcd, else FILE.raw/FILE.cand.\n");
+	fprintf(stderr, "  --decrypt FILE      Decrypt targeted slot (--slot, default 0) to FILE when valid .mcd, else FILE.raw/FILE.cand.\n");
 }
 
 static uint64_t fnv1a64(const uint8_t* data, size_t len);
 static int buffer_looks_high_entropy(const uint8_t* data, size_t len);
 static int slot_has_signature(const uint8_t* slot_data);
 static int score_ps1_slot_layout(const uint8_t* slot_data);
+static void print_first16_hex_to(FILE* out, const uint8_t* data);
 static void print_first16_hex(const uint8_t* data);
 
 typedef enum mcd_verdict {
@@ -332,6 +336,62 @@ static int maybe_transform_slot_with_raw_key(uint8_t* slot_data, uint32_t slot_i
 	return 0;
 }
 
+static int build_best_transformed_slot(const uint8_t* slot_data, uint32_t slot_index, const raw_key_blob_t* raw_key, uint8_t* best_candidate)
+{
+	uint8_t candidate[PS1_RAW_SIZE];
+	uint8_t key_variant[32];
+	int best_score = -1;
+	int mode;
+	int key_mode_start;
+	int key_mode_end;
+	int key_mode;
+
+	if (!slot_data || !raw_key || !raw_key->valid || !best_candidate)
+		return 0;
+
+	if (raw_key->len == 32)
+	{
+		key_mode_start = 0;
+		key_mode_end = 4;
+	}
+	else
+	{
+		key_mode_start = 0;
+		key_mode_end = 1;
+	}
+
+	for (key_mode = key_mode_start; key_mode < key_mode_end; key_mode++)
+	{
+		if (raw_key->len == 32)
+			build_key_variant(key_variant, raw_key->data, key_mode);
+
+		for (mode = 0; mode < 4; mode++)
+		{
+			uint64_t sector_base = (mode & 1) ? (((uint64_t) PS1HD_HEADER_SIZE / 512) + ((uint64_t) slot_index * (PS1_RAW_SIZE / 512))) : ((uint64_t) slot_index * (PS1_RAW_SIZE / 512));
+			int tweak_be = (mode & 2) ? 1 : 0;
+			int score = 0;
+			const uint8_t* key_data = (raw_key->len == 32) ? key_variant : raw_key->data;
+
+			if (!decrypt_slot_xts(slot_data, candidate, sizeof(candidate), key_data, raw_key->len, sector_base, tweak_be))
+				continue;
+
+			score += score_ps1_slot_layout(candidate);
+			if (!buffer_looks_high_entropy(candidate, 4096))
+				score += 2;
+			if (candidate[0] == 'M' && candidate[1] == 'C')
+				score += 2;
+
+			if (score > best_score)
+			{
+				memcpy(best_candidate, candidate, PS1_RAW_SIZE);
+				best_score = score;
+			}
+		}
+	}
+
+	return best_score >= 0;
+}
+
 static double estimate_shannon_entropy(const uint8_t* data, size_t len)
 {
 	uint32_t hist[256] = {0};
@@ -388,7 +448,7 @@ static mcd_validation_t validate_mcd_buffer(const uint8_t* data, size_t len, con
 	out.begins_with_mc = (data[0] == 'M' && data[1] == 'C');
 	out.entropy_4k = estimate_shannon_entropy(data, 4096);
 	out.plausible_dir_flags = dir_frames_look_plausible(data);
-	out.verdict = (out.begins_with_mc && out.entropy_4k < 7.6 && out.plausible_dir_flags) ? MCD_VALID : MCD_NOT_MCD;
+	out.verdict = out.begins_with_mc ? MCD_VALID : MCD_NOT_MCD;
 
 	if (verbose)
 	{
@@ -468,10 +528,17 @@ static int buffer_looks_high_entropy(const uint8_t* data, size_t len)
 
 static void print_first16_hex(const uint8_t* data)
 {
+	print_first16_hex_to(stdout, data);
+}
+
+static void print_first16_hex_to(FILE* out, const uint8_t* data)
+{
 	size_t i;
+	if (!out)
+		out = stdout;
 
 	for (i = 0; i < 16; i++)
-		printf("%02x", data[i]);
+		fprintf(out, "%02x", data[i]);
 }
 
 static int slot_has_signature(const uint8_t* slot_data)
@@ -795,122 +862,122 @@ static int print_vmc_info(const char* path, int has_slot, uint32_t slot, const c
 	return 0;
 }
 
-static int decrypt_vmc_file(const char* input_path, const char* output_path, const raw_key_blob_t* raw_key)
+static int dump_slot_with_validation(const char* vmc_path, uint32_t target_slot, const char* out_prefix, const char* rawkey_path, const raw_key_blob_t* raw_key, const char* op_label)
 {
 	vmc_info_t info;
-	FILE* in;
-	FILE* out;
-	uint8_t buf[PS1_RAW_SIZE];
-	uint8_t header[PS1HD_HEADER_SIZE];
-	uint32_t i;
+	uint8_t raw_slot[PS1_RAW_SIZE];
+	uint8_t cand_slot[PS1_RAW_SIZE];
+	mcd_validation_t validation;
+	char raw_out[1024];
+	char cand_out[1024];
+	int cand_built;
 
-	if (!input_path || !output_path || !raw_key || !raw_key->valid)
+	if (!vmc_path || !out_prefix || !raw_key || !raw_key->valid)
 		return 0;
 
-	if (!vmc_get_info(input_path, &info))
+	if (!vmc_get_info(vmc_path, &info))
 	{
-		fprintf(stderr, "%s: failed to parse VMC file\n", input_path);
-		return 0;
-	}
-
-	in = fopen(input_path, "rb");
-	if (!in)
-	{
-		fprintf(stderr, "%s: failed to open input\n", input_path);
+		fprintf(stderr, "%s: failed to parse VMC file\n", vmc_path);
 		return 0;
 	}
 
-	out = fopen(output_path, "wb");
-	if (!out)
+	if (info.system != VMC_SYSTEM_PS1)
 	{
-		fclose(in);
-		fprintf(stderr, "%s: failed to open output %s\n", input_path, output_path);
+		fprintf(stderr, "%s: %s supports PS1 VMC files only\n", vmc_path, op_label);
 		return 0;
 	}
 
 	if (info.embedded_slots > 0)
 	{
-		if (fread(header, 1, sizeof(header), in) != sizeof(header))
+		if (target_slot >= info.embedded_slots)
 		{
-			fclose(in);
-			fclose(out);
-			fprintf(stderr, "%s: failed to read PS1HD header\n", input_path);
+			fprintf(stderr, "%s: slot %u out of range (0..%u)\n", vmc_path, target_slot, info.embedded_slots - 1);
 			return 0;
 		}
 
-		if (fwrite(header, 1, sizeof(header), out) != sizeof(header))
+		if (!vmc_read_embedded_slot(vmc_path, target_slot, raw_slot, sizeof(raw_slot)))
 		{
-			fclose(in);
-			fclose(out);
-			fprintf(stderr, "%s: failed to write PS1HD header\n", output_path);
+			fprintf(stderr, "%s: failed to read slot %u\n", vmc_path, target_slot);
 			return 0;
-		}
-
-		for (i = 0; i < info.embedded_slots; i++)
-		{
-			if (fread(buf, 1, sizeof(buf), in) != sizeof(buf))
-			{
-				fclose(in);
-				fclose(out);
-				fprintf(stderr, "%s: failed to read slot %u\n", input_path, i);
-				return 0;
-			}
-
-			if (!maybe_transform_slot_with_raw_key(buf, i, raw_key))
-			{
-				fclose(in);
-				fclose(out);
-				fprintf(stderr, "%s: failed to decrypt slot %u with provided raw key\n", input_path, i);
-				return 0;
-			}
-
-			if (fwrite(buf, 1, sizeof(buf), out) != sizeof(buf))
-			{
-				fclose(in);
-				fclose(out);
-				fprintf(stderr, "%s: failed to write slot %u\n", output_path, i);
-				return 0;
-			}
 		}
 	}
 	else if (info.system == VMC_SYSTEM_PS1 && info.raw_size == PS1_RAW_SIZE)
 	{
-		if (fread(buf, 1, sizeof(buf), in) != sizeof(buf))
+		FILE* in = fopen(vmc_path, "rb");
+		if (!in)
 		{
-			fclose(in);
-			fclose(out);
-			fprintf(stderr, "%s: failed to read raw PS1 VMC\n", input_path);
+			fprintf(stderr, "%s: failed to open input\n", vmc_path);
 			return 0;
 		}
 
-		if (!maybe_transform_slot_with_raw_key(buf, 0, raw_key))
+		if (fread(raw_slot, 1, sizeof(raw_slot), in) != sizeof(raw_slot))
 		{
 			fclose(in);
-			fclose(out);
-			fprintf(stderr, "%s: failed to decrypt raw PS1 VMC with provided raw key\n", input_path);
+			fprintf(stderr, "%s: failed to read raw PS1 VMC\n", vmc_path);
 			return 0;
 		}
+		fclose(in);
 
-		if (fwrite(buf, 1, sizeof(buf), out) != sizeof(buf))
+		if (target_slot != 0)
 		{
-			fclose(in);
-			fclose(out);
-			fprintf(stderr, "%s: failed to write decrypted output\n", output_path);
+			fprintf(stderr, "%s: %s requested slot %u but raw PS1 VMC has only slot 0\n", vmc_path, op_label, target_slot);
 			return 0;
 		}
 	}
 	else
 	{
-		fclose(in);
-		fclose(out);
-		fprintf(stderr, "%s: --decrypt currently supports PS1 raw cards and PS1HD container VMCs\n", input_path);
+		fprintf(stderr, "%s: %s supports PS1 raw cards and PS1HD container VMCs\n", vmc_path, op_label);
 		return 0;
 	}
 
-	fclose(in);
-	fclose(out);
-	printf("Decrypted VMC written to %s\n", output_path);
-	return 1;
+	cand_built = build_best_transformed_slot(raw_slot, target_slot, raw_key, cand_slot);
+	if (!cand_built)
+		memset(cand_slot, 0, sizeof(cand_slot));
+
+	validation = validate_mcd_buffer(cand_slot, sizeof(cand_slot), op_label, 0);
+	if (cand_built && validation.verdict == MCD_VALID)
+	{
+		if (!write_buffer_file(out_prefix, cand_slot, sizeof(cand_slot)))
+		{
+			fprintf(stderr, "%s: failed to write %s\n", vmc_path, out_prefix);
+			return 0;
+		}
+
+		printf("%s slot %u -> %s (%u bytes, valid .mcd)\n", op_label, target_slot, out_prefix, PS1_RAW_SIZE);
+		return 1;
+	}
+
+	snprintf(raw_out, sizeof(raw_out), "%s.raw", out_prefix);
+	snprintf(cand_out, sizeof(cand_out), "%s.cand", out_prefix);
+
+	if (!write_buffer_file(raw_out, raw_slot, sizeof(raw_slot)))
+	{
+		fprintf(stderr, "%s: failed to write %s\n", vmc_path, raw_out);
+		return 0;
+	}
+
+	if (cand_built && !write_buffer_file(cand_out, cand_slot, sizeof(cand_slot)))
+	{
+		fprintf(stderr, "%s: failed to write %s\n", vmc_path, cand_out);
+		return 0;
+	}
+
+	fprintf(stderr,
+		"%s slot %u invalid mcd header; key=%s (%zu bytes), candidate_MC=%s, raw16=",
+		op_label,
+		target_slot,
+		rawkey_path ? rawkey_path : "<none>",
+		raw_key->len,
+		(cand_built && cand_slot[0] == 'M' && cand_slot[1] == 'C') ? "yes" : "no");
+	print_first16_hex_to(stderr, raw_slot);
+	fprintf(stderr, " cand16=");
+	if (cand_built)
+		print_first16_hex_to(stderr, cand_slot);
+	else
+		fprintf(stderr, "<none>");
+	fprintf(stderr, " wrote=%s%s%s\n", raw_out, cand_built ? "," : "", cand_built ? cand_out : "");
+
+	return 0;
 }
 
 int main(int argc, char** argv)
@@ -1070,7 +1137,6 @@ int main(int argc, char** argv)
 		vmc_info_t info;
 		const char* vmc_path;
 		raw_key_blob_t raw_key;
-		uint8_t slot_buf[PS1_RAW_SIZE];
 		int raw_key_loaded;
 
 		if (input_count != 1)
@@ -1094,67 +1160,10 @@ int main(int argc, char** argv)
 
 		raw_key_loaded = load_raw_key(rawkey_override, &raw_key);
 
-		if (raw_key_loaded)
-		{
-			uint8_t raw_slot[PS1_RAW_SIZE];
-			char raw_out[1024];
-			char fail_out[1024];
-			int transformed;
-			mcd_validation_t validation;
-
-			if (!vmc_read_embedded_slot(vmc_path, dump_slot, slot_buf, sizeof(slot_buf)))
-			{
-				fprintf(stderr, "%s: failed to read slot %u\n", vmc_path, dump_slot);
-				return 1;
-			}
-			memcpy(raw_slot, slot_buf, sizeof(raw_slot));
-
-			transformed = maybe_transform_slot_with_raw_key(slot_buf, dump_slot, &raw_key);
-			validation = validate_mcd_buffer(slot_buf, sizeof(slot_buf), "dump-slot candidate", 1);
-
-			if (transformed && validation.verdict == MCD_VALID)
-			{
-				if (!write_buffer_file(dump_outfile, slot_buf, sizeof(slot_buf)))
-				{
-					fprintf(stderr, "%s: failed to write %s\n", vmc_path, dump_outfile);
-					return 1;
-				}
-
-				printf("Dumped slot %u to %s (%u bytes, raw-key transform applied and validated as VALID_MCD)\n", dump_slot, dump_outfile, PS1_RAW_SIZE);
-			}
-			else
-			{
-				snprintf(raw_out, sizeof(raw_out), "%s.raw", dump_outfile);
-				snprintf(fail_out, sizeof(fail_out), "%s.fail", dump_outfile);
-
-				if (!write_buffer_file(raw_out, raw_slot, sizeof(raw_slot)))
-				{
-					fprintf(stderr, "%s: failed to write %s\n", vmc_path, raw_out);
-					return 1;
-				}
-
-				if (!write_buffer_file(fail_out, slot_buf, sizeof(slot_buf)))
-				{
-					fprintf(stderr, "%s: failed to write %s\n", vmc_path, fail_out);
-					return 1;
-				}
-
-				fprintf(stderr,
-					"%s: slot %u NOT_MCD after raw-key transform validation; wrote %s (raw bytes) and %s (transformed candidate). Reason: MC=%s, entropy4k=%.3f, dir_flags=%s. Likely causes: wrong raw-key, wrong slot index, wrong transform parameters (sector-base/tweak endianness), or container variant without this transform.\n",
-					vmc_path,
-					dump_slot,
-					raw_out,
-					fail_out,
-					validation.begins_with_mc ? "yes" : "no",
-					validation.entropy_4k,
-					validation.plausible_dir_flags ? "yes" : "no");
-				return 1;
-			}
-		}
-		else
+		if (!raw_key_loaded)
 		{
 			if (rawkey_override)
-				fprintf(stderr, "Warning: unable to load raw key from %s; dumping slot without transform\n", rawkey_override);
+				fprintf(stderr, "Warning: unable to load raw key from %s; dumping raw slot bytes\n", rawkey_override);
 
 			if (!vmc_dump_embedded_slot(vmc_path, dump_slot, dump_outfile))
 			{
@@ -1162,7 +1171,11 @@ int main(int argc, char** argv)
 				return 1;
 			}
 
-			printf("Dumped slot %u to %s (%u bytes)\n", dump_slot, dump_outfile, PS1_RAW_SIZE);
+			printf("dump-slot slot %u -> %s (%u bytes, raw bytes; no valid raw-key transform available)\n", dump_slot, dump_outfile, PS1_RAW_SIZE);
+		}
+		else if (!dump_slot_with_validation(vmc_path, dump_slot, dump_outfile, rawkey_override, &raw_key, "dump-slot"))
+		{
+			return 1;
 		}
 	}
 
@@ -1188,7 +1201,7 @@ int main(int argc, char** argv)
 			return 1;
 		}
 
-		if (!decrypt_vmc_file(input_paths[0], decrypt_outfile, &raw_key))
+		if (!dump_slot_with_validation(input_paths[0], has_slot ? slot : 0, decrypt_outfile, rawkey_override, &raw_key, "decrypt"))
 			return 1;
 	}
 

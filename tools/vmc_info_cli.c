@@ -32,6 +32,23 @@ static int print_vmc_info(const char* path)
 		printf("Raw size: %u bytes\n", info.raw_size);
 		printf("ECC: %s\n", info.has_ecc ? "present" : "not present");
 	}
+	else if (info.system == VMC_SYSTEM_PS1)
+	{
+		switch (info.ps1_signature)
+		{
+			case VMC_PS1_SIGNATURE_PRESENT:
+				printf("Signature: MC\n");
+				break;
+			case VMC_PS1_SIGNATURE_MISSING_BLANK:
+				printf("Signature: missing (treating as unformatted/blank PS1 raw card)\n");
+				break;
+			case VMC_PS1_SIGNATURE_MISSING_UNKNOWN:
+				printf("Signature: missing (treating as PS1 raw card, possibly unformatted)\n");
+				break;
+			default:
+				break;
+		}
+	}
 
 	puts("");
 	return 0;

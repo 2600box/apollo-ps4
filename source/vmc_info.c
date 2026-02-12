@@ -7,6 +7,7 @@
 
 #define PS1CARD_RAW_SIZE 131072
 #define PS2_MAGIC "Sony PS2 Memory Card Format "
+#define PS1_BLANK_CHECK_SIZE 4096
 
 static uint16_t read_le16(const uint8_t* ptr)
 {
@@ -18,13 +19,90 @@ static uint32_t read_le32(const uint8_t* ptr)
 	return (uint32_t) ptr[0] | ((uint32_t) ptr[1] << 8) | ((uint32_t) ptr[2] << 16) | ((uint32_t) ptr[3] << 24);
 }
 
-static int looks_like_ps1_vmc(const uint8_t* hdr, uint64_t size)
+static int is_ps1_headered_size(uint64_t size)
 {
-	if (size == PS1CARD_RAW_SIZE && hdr[0] == 'M' && hdr[1] == 'C')
-		return 1;
+	return (size == 0x20040 || size == 0x20080 || size == 0x200A0 || size == 0x20F40);
+}
 
-	if ((size == 0x20040 || size == 0x20080 || size == 0x200A0 || size == 0x20F40) && hdr[0x80] == 'M' && hdr[0x81] == 'C')
+static int check_ps1_blank_prefix(FILE* fp, uint64_t size)
+{
+	uint8_t block[256];
+	uint64_t remaining;
+	int all_zero = 1;
+	int all_ff = 1;
+
+	if (!fp)
+		return 0;
+
+	remaining = (size < PS1_BLANK_CHECK_SIZE) ? size : PS1_BLANK_CHECK_SIZE;
+	if (remaining == 0)
+		return 0;
+
+	if (fseeko(fp, 0, SEEK_SET) < 0)
+		return 0;
+
+	while (remaining > 0)
+	{
+		size_t chunk = (remaining > sizeof(block)) ? sizeof(block) : (size_t) remaining;
+		size_t read = fread(block, 1, chunk, fp);
+
+		if (read != chunk)
+			return 0;
+
+		for (size_t i = 0; i < read; i++)
+		{
+			if (block[i] != 0x00)
+				all_zero = 0;
+			if (block[i] != 0xFF)
+				all_ff = 0;
+
+			if (!all_zero && !all_ff)
+				return 0;
+		}
+
+		remaining -= read;
+	}
+
+	return 1;
+}
+
+static int detect_ps1_vmc(FILE* fp, const uint8_t* hdr, size_t hdr_size, uint64_t size, vmc_info_t* info)
+{
+	if (!info)
+		return 0;
+
+	if (size == PS1CARD_RAW_SIZE)
+	{
+		info->system = VMC_SYSTEM_PS1;
+		info->raw_size = PS1CARD_RAW_SIZE;
+
+		if (hdr_size >= 2 && hdr[0] == 'M' && hdr[1] == 'C')
+		{
+			info->ps1_signature = VMC_PS1_SIGNATURE_PRESENT;
+			info->format = "PS1 Memory Card";
+		}
+		else if (check_ps1_blank_prefix(fp, size))
+		{
+			info->ps1_signature = VMC_PS1_SIGNATURE_MISSING_BLANK;
+			info->format = "PS1 Memory Card (unformatted/blank)";
+		}
+		else
+		{
+			info->ps1_signature = VMC_PS1_SIGNATURE_MISSING_UNKNOWN;
+			info->format = "PS1 Memory Card (unknown signature)";
+		}
+
 		return 1;
+	}
+
+	if (is_ps1_headered_size(size) && hdr_size >= 0x82 && hdr[0x80] == 'M' && hdr[0x81] == 'C')
+	{
+		info->system = VMC_SYSTEM_PS1;
+		info->raw_size = PS1CARD_RAW_SIZE;
+		info->ps1_signature = VMC_PS1_SIGNATURE_PRESENT;
+		info->format = "PS1 Memory Card";
+		return 1;
+	}
 
 	return 0;
 }
@@ -53,6 +131,7 @@ int vmc_get_info(const char* path, vmc_info_t* info)
 
 	memset(info, 0, sizeof(*info));
 	info->format = "Unknown";
+	info->ps1_signature = VMC_PS1_SIGNATURE_NA;
 
 	fp = fopen(path, "rb");
 	if (!fp)
@@ -72,9 +151,11 @@ int vmc_get_info(const char* path, vmc_info_t* info)
 	}
 
 	n = fread(hdr, 1, sizeof(hdr), fp);
-	fclose(fp);
 	if (n < 0x90)
+	{
+		fclose(fp);
 		return 0;
+	}
 
 	if (!memcmp(hdr, PS2_MAGIC, sizeof(PS2_MAGIC) - 1))
 	{
@@ -88,22 +169,26 @@ int vmc_get_info(const char* path, vmc_info_t* info)
 
 		raw_size = (uint64_t) info->pagesize * info->pages_per_cluster * info->clusters_per_card;
 		if (raw_size > UINT32_MAX)
+		{
+			fclose(fp);
 			return 0;
+		}
 
 		info->raw_size = (uint32_t) raw_size;
 		if (raw_size > 0 && info->file_size == raw_size + (raw_size / 32))
 			info->has_ecc = 1;
+		fclose(fp);
 
 		return 1;
 	}
 
-	if (looks_like_ps1_vmc(hdr, info->file_size))
+	if (detect_ps1_vmc(fp, hdr, n, info->file_size, info))
 	{
-		info->system = VMC_SYSTEM_PS1;
-		info->raw_size = PS1CARD_RAW_SIZE;
-		info->format = "PS1 Memory Card";
+		fclose(fp);
 		return 1;
 	}
+
+	fclose(fp);
 
 	return 0;
 }

@@ -7,6 +7,11 @@
 #define VMC_SYSTEM_PS1     1
 #define VMC_SYSTEM_PS2     2
 
+#define VMC_PS1_SIGNATURE_NA              0
+#define VMC_PS1_SIGNATURE_PRESENT         1
+#define VMC_PS1_SIGNATURE_MISSING_BLANK   2
+#define VMC_PS1_SIGNATURE_MISSING_UNKNOWN 3
+
 typedef struct vmc_info {
 	int system;
 	uint64_t file_size;
@@ -15,6 +20,7 @@ typedef struct vmc_info {
 	uint32_t pages_per_cluster;
 	uint32_t clusters_per_card;
 	int has_ecc;
+	int ps1_signature;
 	const char* format;
 } vmc_info_t;
 

@@ -107,6 +107,31 @@ static int detect_ps1_vmc(FILE* fp, const uint8_t* hdr, size_t hdr_size, uint64_
 	return 0;
 }
 
+static int detect_ps1hd_vmc_container(const uint8_t* hdr, size_t hdr_size, uint64_t size, vmc_info_t* info)
+{
+	if (!hdr || !info)
+		return 0;
+
+	if (hdr_size < 0x2C || size <= PS1CARD_RAW_SIZE)
+		return 0;
+
+	/*
+	 * PS1HD virtual memory cards embedded in PS4 save images are wrapped in a
+	 * container header and don't expose the raw "MC" signature at file offset 0.
+	 * We identify this wrapper using its stable header fields.
+	 */
+	if (read_le32(hdr + 0x00) == 1 && read_le32(hdr + 0x20) == 0x8000 && read_le32(hdr + 0x24) == 1 && read_le32(hdr + 0x28) == 1)
+	{
+		info->system = VMC_SYSTEM_PS1;
+		info->raw_size = PS1CARD_RAW_SIZE;
+		info->ps1_signature = VMC_PS1_SIGNATURE_MISSING_UNKNOWN;
+		info->format = "PS1HD VMC container";
+		return 1;
+	}
+
+	return 0;
+}
+
 const char* vmc_system_name(int system)
 {
 	switch (system)
@@ -183,6 +208,12 @@ int vmc_get_info(const char* path, vmc_info_t* info)
 	}
 
 	if (detect_ps1_vmc(fp, hdr, n, info->file_size, info))
+	{
+		fclose(fp);
+		return 1;
+	}
+
+	if (detect_ps1hd_vmc_container(hdr, n, info->file_size, info))
 	{
 		fclose(fp);
 		return 1;

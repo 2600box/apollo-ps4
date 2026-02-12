@@ -4,6 +4,7 @@
 #include <string.h>
 #include <inttypes.h>
 #include <ctype.h>
+#include <math.h>
 
 #include <openssl/evp.h>
 
@@ -26,6 +27,19 @@ static uint64_t fnv1a64(const uint8_t* data, size_t len);
 static int buffer_looks_high_entropy(const uint8_t* data, size_t len);
 static int slot_has_signature(const uint8_t* slot_data);
 static int score_ps1_slot_layout(const uint8_t* slot_data);
+static void print_first16_hex(const uint8_t* data);
+
+typedef enum mcd_verdict {
+	MCD_NOT_MCD = 0,
+	MCD_VALID = 1,
+} mcd_verdict_t;
+
+typedef struct mcd_validation {
+	mcd_verdict_t verdict;
+	double entropy_4k;
+	int begins_with_mc;
+	int plausible_dir_flags;
+} mcd_validation_t;
 
 static const size_t g_raw_key_sizes[] = {16, 32, 48};
 
@@ -316,6 +330,100 @@ static int maybe_transform_slot_with_raw_key(uint8_t* slot_data, uint32_t slot_i
 	}
 
 	return 0;
+}
+
+static double estimate_shannon_entropy(const uint8_t* data, size_t len)
+{
+	uint32_t hist[256] = {0};
+	size_t i;
+	double entropy = 0.0;
+
+	if (!data || len == 0)
+		return 0.0;
+
+	for (i = 0; i < len; i++)
+		hist[data[i]]++;
+
+	for (i = 0; i < 256; i++)
+	{
+		double p;
+		if (hist[i] == 0)
+			continue;
+		p = (double) hist[i] / (double) len;
+		entropy -= p * (log(p) / log(2.0));
+	}
+
+	return entropy;
+}
+
+static int dir_frames_look_plausible(const uint8_t* slot_data)
+{
+	int i;
+	int plausible = 0;
+
+	if (!slot_data)
+		return 0;
+
+	for (i = 0; i < PS1_SLOT_COUNT; i++)
+	{
+		const uint8_t* dir = slot_data + PS1_DIR_OFFSET + (i * PS1_DIR_ENTRY_SIZE);
+		uint8_t type = dir[0];
+
+		if (type == 0xA0 || type == 0xA1 || type == 0xA2 || type == 0xA3 ||
+			type == 0x50 || type == 0x51 || type == 0x52 || type == 0x53)
+			plausible++;
+	}
+
+	return plausible >= 10;
+}
+
+static mcd_validation_t validate_mcd_buffer(const uint8_t* data, size_t len, const char* label, int verbose)
+{
+	mcd_validation_t out;
+
+	memset(&out, 0, sizeof(out));
+	if (!data || len != PS1_RAW_SIZE)
+		return out;
+
+	out.begins_with_mc = (data[0] == 'M' && data[1] == 'C');
+	out.entropy_4k = estimate_shannon_entropy(data, 4096);
+	out.plausible_dir_flags = dir_frames_look_plausible(data);
+	out.verdict = (out.begins_with_mc && out.entropy_4k < 7.6 && out.plausible_dir_flags) ? MCD_VALID : MCD_NOT_MCD;
+
+	if (verbose)
+	{
+		printf("MCD check (%s):\n", label ? label : "buffer");
+		printf("  first16: ");
+		print_first16_hex(data);
+		printf("\n");
+		printf("  begins_with_MC: %s\n", out.begins_with_mc ? "yes" : "no");
+		printf("  entropy(first4k): %.3f bits/byte (%s)\n", out.entropy_4k, out.entropy_4k > 7.6 ? "high" : "normal");
+		printf("  plausible_directory_flags: %s\n", out.plausible_dir_flags ? "yes" : "no");
+		printf("  verdict: %s\n", out.verdict == MCD_VALID ? "VALID_MCD" : "NOT_MCD");
+	}
+
+	return out;
+}
+
+static int write_buffer_file(const char* path, const uint8_t* data, size_t len)
+{
+	FILE* out;
+
+	if (!path || !data)
+		return 0;
+
+	out = fopen(path, "wb");
+	if (!out)
+		return 0;
+
+	if (fwrite(data, 1, len, out) != len)
+	{
+		fclose(out);
+		return 0;
+	}
+
+	fclose(out);
+	return 1;
 }
 
 static uint64_t fnv1a64(const uint8_t* data, size_t len)
@@ -988,36 +1096,60 @@ int main(int argc, char** argv)
 
 		if (raw_key_loaded)
 		{
-			FILE* out;
+			uint8_t raw_slot[PS1_RAW_SIZE];
+			char raw_out[1024];
+			char fail_out[1024];
 			int transformed;
+			mcd_validation_t validation;
 
 			if (!vmc_read_embedded_slot(vmc_path, dump_slot, slot_buf, sizeof(slot_buf)))
 			{
 				fprintf(stderr, "%s: failed to read slot %u\n", vmc_path, dump_slot);
 				return 1;
 			}
+			memcpy(raw_slot, slot_buf, sizeof(raw_slot));
 
 			transformed = maybe_transform_slot_with_raw_key(slot_buf, dump_slot, &raw_key);
+			validation = validate_mcd_buffer(slot_buf, sizeof(slot_buf), "dump-slot candidate", 1);
 
-			out = fopen(dump_outfile, "wb");
-			if (!out)
+			if (transformed && validation.verdict == MCD_VALID)
 			{
-				fprintf(stderr, "%s: failed to open %s\n", vmc_path, dump_outfile);
-				return 1;
-			}
+				if (!write_buffer_file(dump_outfile, slot_buf, sizeof(slot_buf)))
+				{
+					fprintf(stderr, "%s: failed to write %s\n", vmc_path, dump_outfile);
+					return 1;
+				}
 
-			if (fwrite(slot_buf, 1, sizeof(slot_buf), out) != sizeof(slot_buf))
-			{
-				fclose(out);
-				fprintf(stderr, "%s: failed to write %s\n", vmc_path, dump_outfile);
-				return 1;
+				printf("Dumped slot %u to %s (%u bytes, raw-key transform applied and validated as VALID_MCD)\n", dump_slot, dump_outfile, PS1_RAW_SIZE);
 			}
-
-			fclose(out);
-			if (transformed)
-				printf("Dumped slot %u to %s (%u bytes, raw-key transform applied)\n", dump_slot, dump_outfile, PS1_RAW_SIZE);
 			else
-				printf("Dumped slot %u to %s (%u bytes, raw-key transform could not be validated; wrote raw slot bytes)\n", dump_slot, dump_outfile, PS1_RAW_SIZE);
+			{
+				snprintf(raw_out, sizeof(raw_out), "%s.raw", dump_outfile);
+				snprintf(fail_out, sizeof(fail_out), "%s.fail", dump_outfile);
+
+				if (!write_buffer_file(raw_out, raw_slot, sizeof(raw_slot)))
+				{
+					fprintf(stderr, "%s: failed to write %s\n", vmc_path, raw_out);
+					return 1;
+				}
+
+				if (!write_buffer_file(fail_out, slot_buf, sizeof(slot_buf)))
+				{
+					fprintf(stderr, "%s: failed to write %s\n", vmc_path, fail_out);
+					return 1;
+				}
+
+				fprintf(stderr,
+					"%s: slot %u NOT_MCD after raw-key transform validation; wrote %s (raw bytes) and %s (transformed candidate). Reason: MC=%s, entropy4k=%.3f, dir_flags=%s. Likely causes: wrong raw-key, wrong slot index, wrong transform parameters (sector-base/tweak endianness), or container variant without this transform.\n",
+					vmc_path,
+					dump_slot,
+					raw_out,
+					fail_out,
+					validation.begins_with_mc ? "yes" : "no",
+					validation.entropy_4k,
+					validation.plausible_dir_flags ? "yes" : "no");
+				return 1;
+			}
 		}
 		else
 		{

@@ -1,19 +1,74 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
 #include <inttypes.h>
 
 #include "vmc_info.h"
 
+#define SLOT_SUMMARY_LIMIT 10
+#define PS1HD_HEADER_SIZE 0x8000
+#define PS1_RAW_SIZE 0x20000
+
 static void print_usage(const char* argv0)
 {
-	fprintf(stderr, "Usage: %s <memory-card.vmc> [more.vmc ...]\n", argv0);
+	fprintf(stderr, "Usage: %s [--slot N] <memory-card.vmc> [more.vmc ...]\n", argv0);
 }
 
-static int print_vmc_info(const char* path)
+static void print_ps1_signature(const vmc_info_t* info)
+{
+	switch (info->ps1_signature)
+	{
+		case VMC_PS1_SIGNATURE_PRESENT:
+			printf("Signature: present\n");
+			break;
+		case VMC_PS1_SIGNATURE_MISSING_BLANK:
+			printf("Signature: missing (treating as unformatted/blank PS1 raw card)\n");
+			break;
+		case VMC_PS1_SIGNATURE_MISSING_UNKNOWN:
+			printf("Signature: missing\n");
+			break;
+		default:
+			break;
+	}
+}
+
+static int print_slot_summary(const char* path, uint32_t slots)
+{
+	uint32_t i;
+	uint32_t limit = slots;
+
+	if (limit > SLOT_SUMMARY_LIMIT)
+		limit = SLOT_SUMMARY_LIMIT;
+
+	printf("Container header size: %u bytes\n", PS1HD_HEADER_SIZE);
+	printf("Embedded card size: %u bytes\n", PS1_RAW_SIZE);
+	printf("Embedded slots: %u\n", slots);
+
+	for (i = 0; i < limit; i++)
+	{
+		vmc_info_t slot_info;
+
+		if (!vmc_get_info_slot(path, &slot_info, i))
+		{
+			printf("slot %u: <read error>\n", i);
+			continue;
+		}
+
+		printf("slot %u: signature %s\n", i, slot_info.signature_present ? "present" : "missing");
+	}
+
+	if (slots > limit)
+		printf("...\n");
+
+	return 0;
+}
+
+static int print_vmc_info(const char* path, int has_slot, uint32_t slot)
 {
 	vmc_info_t info;
 
-	if (!vmc_get_info(path, &info))
+	if ((has_slot && !vmc_get_info_slot(path, &info, slot)) || (!has_slot && !vmc_get_info(path, &info)))
 	{
 		fprintf(stderr, "%s: failed to parse VMC file\n", path);
 		return 1;
@@ -36,29 +91,23 @@ static int print_vmc_info(const char* path)
 	{
 		printf("Raw size: %u bytes\n", info.raw_size);
 
-		switch (info.ps1_signature)
+		if (!has_slot && info.embedded_slots > 0)
+			print_slot_summary(path, info.embedded_slots);
+
+		if (info.embedded_slots > 0)
 		{
-			case VMC_PS1_SIGNATURE_PRESENT:
-				printf("Signature: MC\n");
-				break;
-			case VMC_PS1_SIGNATURE_MISSING_BLANK:
-				printf("Signature: missing (treating as unformatted/blank PS1 raw card)\n");
-				break;
-			case VMC_PS1_SIGNATURE_MISSING_UNKNOWN:
-				printf("Signature: missing (treating as PS1 raw card, possibly unformatted)\n");
-				break;
-			default:
-				break;
+			printf("Embedded slot: %u / %u\n", info.embedded_slot, info.embedded_slots - 1);
+			printf("Embedded offset: %" PRIu64 " (0x%" PRIx64 ")\n", info.embedded_offset, info.embedded_offset);
+			printf("Embedded size: %u bytes\n", info.embedded_size);
+			printf("Signature: %s\n", info.signature_present ? "present" : "missing");
+		}
+		else
+		{
+			print_ps1_signature(&info);
 		}
 
 		if (info.container)
 			printf("Container: %s\n", info.container);
-
-		if (info.embedded_size > 0)
-		{
-			printf("Embedded offset: %" PRIu64 "\n", info.embedded_offset);
-			printf("Embedded size: %u bytes\n", info.embedded_size);
-		}
 	}
 
 	puts("");
@@ -69,6 +118,9 @@ int main(int argc, char** argv)
 {
 	int i;
 	int failed = 0;
+	int argi = 1;
+	int has_slot = 0;
+	uint32_t slot = 0;
 
 	if (argc < 2)
 	{
@@ -76,8 +128,37 @@ int main(int argc, char** argv)
 		return 1;
 	}
 
-	for (i = 1; i < argc; i++)
-		failed |= print_vmc_info(argv[i]);
+	if (argi < argc && strcmp(argv[argi], "--slot") == 0)
+	{
+		char* end;
+		unsigned long parsed;
+
+		if (argi + 2 >= argc)
+		{
+			print_usage(argv[0]);
+			return 1;
+		}
+
+		parsed = strtoul(argv[argi + 1], &end, 10);
+		if (*argv[argi + 1] == '\0' || *end != '\0' || parsed > UINT32_MAX)
+		{
+			fprintf(stderr, "Invalid slot value: %s\n", argv[argi + 1]);
+			return 1;
+		}
+
+		slot = (uint32_t) parsed;
+		has_slot = 1;
+		argi += 2;
+	}
+
+	if (argi >= argc)
+	{
+		print_usage(argv[0]);
+		return 1;
+	}
+
+	for (i = argi; i < argc; i++)
+		failed |= print_vmc_info(argv[i], has_slot, slot);
 
 	return failed ? 2 : 0;
 }

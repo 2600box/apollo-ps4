@@ -212,6 +212,16 @@ You need to have installed:
 
 Run `make` to create a release build. If you want to include the latest save patches in your `.pkg` file, run `make createzip`.
 
+Run `make vmcinfo` to build a standalone Linux CLI utility (`tools/vmcinfo`) that reads `.vmc` files and prints memory-card metadata.
+This target is intended to run on amd64 Debian/Linux hosts and does not require the PS4 SDK.
+
+Example:
+
+```bash
+make vmcinfo
+./tools/vmcinfo /path/to/card.vmc
+```
+
 You can also set the `PS3LOAD` environment variable to your PS4 IP address: `export PS3LOAD=tcp:x.x.x.x`.
 This will allow you to use a [ps3load client](https://github.com/bucanero/ps4load/tree/main/client) and send the `eboot.bin` directly to the [PS4Load listener](https://github.com/bucanero/ps4load).
 

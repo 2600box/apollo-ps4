@@ -5,6 +5,8 @@
 #include <inttypes.h>
 #include <ctype.h>
 
+#include <openssl/evp.h>
+
 #include "vmc_info.h"
 
 #define SLOT_SUMMARY_LIMIT 10
@@ -21,8 +23,16 @@ static void print_usage(const char* argv0)
 }
 
 static uint64_t fnv1a64(const uint8_t* data, size_t len);
+static int buffer_looks_high_entropy(const uint8_t* data, size_t len);
+static int slot_has_signature(const uint8_t* slot_data);
 
 static const size_t g_raw_key_sizes[] = {16, 32, 48};
+
+typedef struct raw_key_blob {
+	uint8_t data[64];
+	size_t len;
+	int valid;
+} raw_key_blob_t;
 
 static int raw_key_size_allowed(size_t size)
 {
@@ -137,6 +147,121 @@ static void print_raw_key_info(const char* rawkey_path)
 	for (size_t i = len - 8; i < len; i++)
 		printf("%02x", data[i]);
 	printf(" fnv1a64=%016" PRIx64 "\n", hash);
+}
+
+static int load_raw_key(const char* rawkey_path, raw_key_blob_t* out)
+{
+	if (!out)
+		return 0;
+
+	memset(out, 0, sizeof(*out));
+	if (!rawkey_path)
+		return 0;
+
+	if (!read_file_bytes(rawkey_path, out->data, sizeof(out->data), &out->len))
+		return 0;
+
+	if (!raw_key_size_allowed(out->len))
+		return 0;
+
+	out->valid = 1;
+	return 1;
+}
+
+static int decrypt_slot_xts(const uint8_t* in, uint8_t* out, size_t len, const uint8_t* key, size_t key_len, uint64_t sector_base, int tweak_be)
+{
+	EVP_CIPHER_CTX* ctx;
+	const EVP_CIPHER* cipher = NULL;
+	uint8_t iv[16];
+	int out_len;
+	size_t off;
+
+	if (!in || !out || !key || len % 512 != 0)
+		return 0;
+
+	if (key_len == 32)
+		cipher = EVP_aes_128_xts();
+#ifdef EVP_aes_256_xts
+	else if (key_len == 64)
+		cipher = EVP_aes_256_xts();
+#endif
+	else
+		return 0;
+
+	ctx = EVP_CIPHER_CTX_new();
+	if (!ctx)
+		return 0;
+
+	for (off = 0; off < len; off += 512)
+	{
+		uint64_t sector = sector_base + (off / 512);
+		size_t i;
+
+		memset(iv, 0, sizeof(iv));
+		for (i = 0; i < 8; i++)
+		{
+			uint8_t v = (uint8_t) ((sector >> (8 * i)) & 0xFF);
+			iv[tweak_be ? (7 - i) : i] = v;
+		}
+
+		if (EVP_DecryptInit_ex(ctx, cipher, NULL, key, iv) != 1)
+		{
+			EVP_CIPHER_CTX_free(ctx);
+			return 0;
+		}
+
+		if (EVP_CIPHER_CTX_set_padding(ctx, 0) != 1)
+		{
+			EVP_CIPHER_CTX_free(ctx);
+			return 0;
+		}
+
+		if (EVP_DecryptUpdate(ctx, out + off, &out_len, in + off, 512) != 1 || out_len != 512)
+		{
+			EVP_CIPHER_CTX_free(ctx);
+			return 0;
+		}
+	}
+
+	EVP_CIPHER_CTX_free(ctx);
+	return 1;
+}
+
+static int maybe_transform_slot_with_raw_key(uint8_t* slot_data, uint32_t slot_index, const raw_key_blob_t* raw_key)
+{
+	uint8_t candidate[PS1_RAW_SIZE];
+	int best_score = -1;
+	int transformed = 0;
+	int mode;
+
+	if (!slot_data || !raw_key || !raw_key->valid)
+		return 0;
+
+	for (mode = 0; mode < 4; mode++)
+	{
+		uint64_t sector_base = (mode & 1) ? (((uint64_t) PS1HD_HEADER_SIZE / 512) + ((uint64_t) slot_index * (PS1_RAW_SIZE / 512))) : ((uint64_t) slot_index * (PS1_RAW_SIZE / 512));
+		int tweak_be = (mode & 2) ? 1 : 0;
+		int score = 0;
+
+		if (!decrypt_slot_xts(slot_data, candidate, sizeof(candidate), raw_key->data, raw_key->len, sector_base, tweak_be))
+			continue;
+
+		if (slot_has_signature(candidate))
+			score += 4;
+		if (!buffer_looks_high_entropy(candidate, 4096))
+			score += 2;
+		if (candidate[0] == 'M' && candidate[1] == 'C')
+			score += 2;
+
+		if (score > best_score)
+		{
+			memcpy(slot_data, candidate, sizeof(candidate));
+			best_score = score;
+			transformed = 1;
+		}
+	}
+
+	return transformed && best_score >= 4;
 }
 
 static uint64_t fnv1a64(const uint8_t* data, size_t len)
@@ -296,7 +421,7 @@ static void print_ps1_signature(const vmc_info_t* info)
 	}
 }
 
-static int print_slot_summary(const char* path, uint32_t slots, int encrypted, int show_fingerprint)
+static int print_slot_summary(const char* path, uint32_t slots, int encrypted, int show_fingerprint, const raw_key_blob_t* raw_key)
 {
 	uint32_t i;
 	uint32_t limit = slots;
@@ -310,18 +435,22 @@ static int print_slot_summary(const char* path, uint32_t slots, int encrypted, i
 
 	for (i = 0; i < limit; i++)
 	{
-		vmc_info_t slot_info;
+		uint8_t slot_buf[PS1_RAW_SIZE];
+		int signature_present;
 
-		if (!vmc_get_info_slot(path, &slot_info, i))
+		if (!vmc_read_embedded_slot(path, i, slot_buf, sizeof(slot_buf)))
 		{
 			printf("slot %u: <read error>\n", i);
 			continue;
 		}
 
-		if (!slot_info.signature_present && encrypted)
+		(void) maybe_transform_slot_with_raw_key(slot_buf, i, raw_key);
+		signature_present = slot_has_signature(slot_buf);
+
+		if (!signature_present && encrypted)
 			printf("slot %u: signature missing (high entropy)\n", i);
 		else
-			printf("slot %u: signature %s\n", i, slot_info.signature_present ? "present" : "missing");
+			printf("slot %u: signature %s\n", i, signature_present ? "present" : "missing");
 	}
 
 	if (slots > limit)
@@ -333,6 +462,8 @@ static int print_slot_summary(const char* path, uint32_t slots, int encrypted, i
 
 		if (!vmc_read_embedded_slot(path, i, slot_buf, sizeof(slot_buf)))
 			continue;
+
+		(void) maybe_transform_slot_with_raw_key(slot_buf, i, raw_key);
 
 		print_slot_save_details(slot_buf, i);
 	}
@@ -354,6 +485,8 @@ static int print_slot_summary(const char* path, uint32_t slots, int encrypted, i
 			}
 
 			hash = fnv1a64(slot_buf, sizeof(slot_buf));
+			(void) maybe_transform_slot_with_raw_key(slot_buf, i, raw_key);
+			hash = fnv1a64(slot_buf, sizeof(slot_buf));
 			signature_present = slot_has_signature(slot_buf);
 			high_entropy = buffer_looks_high_entropy(slot_buf, 4096);
 
@@ -373,8 +506,12 @@ static int print_vmc_info(const char* path, int has_slot, uint32_t slot, const c
 {
 	vmc_info_t info;
 	pfs_sealedkey_info_t sk_info;
+	raw_key_blob_t raw_key;
 	int sealedkey_valid = 0;
 	const char* sealedkey_path = NULL;
+	int raw_key_loaded = 0;
+
+	raw_key_loaded = load_raw_key(rawkey_override, &raw_key);
 
 	if ((has_slot && !vmc_get_info_slot(path, &info, slot)) || (!has_slot && !vmc_get_info(path, &info)))
 	{
@@ -402,14 +539,14 @@ static int print_vmc_info(const char* path, int has_slot, uint32_t slot, const c
 		(void) explicit_list_slots;
 
 		if (!has_slot && info.embedded_slots > 0)
-			print_slot_summary(path, info.embedded_slots, info.slot_payload_suspect_encrypted, fingerprint);
+			print_slot_summary(path, info.embedded_slots, info.slot_payload_suspect_encrypted && !raw_key_loaded, fingerprint, raw_key_loaded ? &raw_key : NULL);
 
 		if (info.embedded_slots > 0)
 		{
 			printf("Embedded slot: %u / %u\n", info.embedded_slot, info.embedded_slots - 1);
 			printf("Embedded offset: %" PRIu64 " (0x%" PRIx64 ")\n", info.embedded_offset, info.embedded_offset);
 			printf("Embedded size: %u bytes\n", info.embedded_size);
-			if (info.slot_payload_suspect_encrypted)
+			if (info.slot_payload_suspect_encrypted && !raw_key_loaded)
 				printf("Signature: missing (payload appears encrypted/protected; PS1 'MC' header not visible)\n");
 			else
 				printf("Signature: %s\n", info.signature_present ? "present" : "missing");

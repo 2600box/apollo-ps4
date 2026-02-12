@@ -101,7 +101,7 @@ createzip: ## Download the latest appdata.zip cheat pack.
 
 
 vmcinfo: ## Build the Linux VMC info CLI utility (amd64).
-	gcc -O2 -Wall -Wextra -Iinclude -o tools/vmcinfo tools/vmc_info_cli.c source/vmc_info.c
+	gcc -O2 -Wall -Wextra -Iinclude -o tools/vmcinfo tools/vmc_info_cli.c source/vmc_info.c -lcrypto
 
 help: ## Display this help message.
 	@echo "Usage: make [target]"

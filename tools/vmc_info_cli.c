@@ -17,7 +17,126 @@
 
 static void print_usage(const char* argv0)
 {
-	fprintf(stderr, "Usage: %s [--slot N] [--list-slots] [--fingerprint] [--dump-slot N OUTFILE] [--sealedkey PATH] <memory-card.vmc> [more...]\n", argv0);
+	fprintf(stderr, "Usage: %s [--slot N] [--list-slots] [--fingerprint] [--dump-slot N OUTFILE] [--sealedkey PATH] [--rawkey PATH] <memory-card.vmc> [more...]\n", argv0);
+}
+
+static uint64_t fnv1a64(const uint8_t* data, size_t len);
+
+static const size_t g_raw_key_sizes[] = {16, 32, 48};
+
+static int raw_key_size_allowed(size_t size)
+{
+	size_t i;
+
+	for (i = 0; i < sizeof(g_raw_key_sizes) / sizeof(g_raw_key_sizes[0]); i++)
+	{
+		if (g_raw_key_sizes[i] == size)
+			return 1;
+	}
+
+	return 0;
+}
+
+static int read_file_size(const char* path, size_t* out_size)
+{
+	FILE* fp;
+	long size;
+
+	if (!path || !out_size)
+		return 0;
+
+	fp = fopen(path, "rb");
+	if (!fp)
+		return 0;
+
+	if (fseeko(fp, 0, SEEK_END) < 0)
+	{
+		fclose(fp);
+		return 0;
+	}
+
+	size = ftello(fp);
+	fclose(fp);
+	if (size < 0)
+		return 0;
+
+	*out_size = (size_t) size;
+	return 1;
+}
+
+static int read_file_bytes(const char* path, uint8_t* buf, size_t want, size_t* got)
+{
+	FILE* fp;
+	long size;
+
+	if (!path || !buf || !got)
+		return 0;
+
+	*got = 0;
+	fp = fopen(path, "rb");
+	if (!fp)
+		return 0;
+
+	if (fseeko(fp, 0, SEEK_END) < 0)
+	{
+		fclose(fp);
+		return 0;
+	}
+
+	size = ftello(fp);
+	if (size < 0 || fseeko(fp, 0, SEEK_SET) < 0)
+	{
+		fclose(fp);
+		return 0;
+	}
+
+	if ((size_t) size > want)
+	{
+		fclose(fp);
+		return 0;
+	}
+
+	if (fread(buf, 1, (size_t) size, fp) != (size_t) size)
+	{
+		fclose(fp);
+		return 0;
+	}
+
+	fclose(fp);
+	*got = (size_t) size;
+	return 1;
+}
+
+static void print_raw_key_info(const char* rawkey_path)
+{
+	uint8_t data[64];
+	size_t len;
+	uint64_t hash;
+
+	if (!rawkey_path)
+		return;
+
+	if (!read_file_bytes(rawkey_path, data, sizeof(data), &len))
+	{
+		printf("Raw key: unreadable [%s]\n", rawkey_path);
+		return;
+	}
+
+	if (!raw_key_size_allowed(len))
+	{
+		printf("Raw key: unsupported size (%zu bytes; expected 16/32/48) [%s]\n", len, rawkey_path);
+		return;
+	}
+
+	hash = fnv1a64(data, len);
+	printf("Raw key: present (%zu bytes) [%s]\n", len, rawkey_path);
+	printf("Raw key fingerprint: first8=");
+	for (size_t i = 0; i < 8; i++)
+		printf("%02x", data[i]);
+	printf(" last8=");
+	for (size_t i = len - 8; i < len; i++)
+		printf("%02x", data[i]);
+	printf(" fnv1a64=%016" PRIx64 "\n", hash);
 }
 
 static uint64_t fnv1a64(const uint8_t* data, size_t len)
@@ -250,7 +369,7 @@ static int print_slot_summary(const char* path, uint32_t slots, int encrypted, i
 	return 0;
 }
 
-static int print_vmc_info(const char* path, int has_slot, uint32_t slot, const char* sealedkey_override, int explicit_list_slots, int fingerprint)
+static int print_vmc_info(const char* path, int has_slot, uint32_t slot, const char* sealedkey_override, const char* rawkey_override, int explicit_list_slots, int fingerprint)
 {
 	vmc_info_t info;
 	pfs_sealedkey_info_t sk_info;
@@ -310,6 +429,9 @@ static int print_vmc_info(const char* path, int has_slot, uint32_t slot, const c
 
 		if (sealedkey_path)
 		{
+			size_t sealedkey_size = 0;
+			int sealedkey_size_known = read_file_size(sealedkey_path, &sealedkey_size);
+
 			if (pfs_parse_sealedkey(sealedkey_path, &sk_info) && sk_info.valid)
 				sealedkey_valid = 1;
 
@@ -321,8 +443,13 @@ static int print_vmc_info(const char* path, int has_slot, uint32_t slot, const c
 			else if (sealedkey_override)
 			{
 				printf("Sealed key: invalid (expected 96 bytes + magic pfsSKKey)\n");
+				if (sealedkey_size_known && raw_key_size_allowed(sealedkey_size))
+					printf("Hint: This looks like a raw key blob; use --rawkey instead.\n");
 			}
 		}
+
+		if (rawkey_override)
+			print_raw_key_info(rawkey_override);
 	}
 
 	puts("");
@@ -342,6 +469,7 @@ int main(int argc, char** argv)
 	uint32_t dump_slot = 0;
 	const char* dump_outfile = NULL;
 	const char* sealedkey_override = NULL;
+	const char* rawkey_override = NULL;
 
 	if (argc < 2)
 	{
@@ -427,6 +555,19 @@ int main(int argc, char** argv)
 			continue;
 		}
 
+		if (strcmp(argv[argi], "--rawkey") == 0)
+		{
+			if (argi + 2 >= argc)
+			{
+				print_usage(argv[0]);
+				return 1;
+			}
+
+			rawkey_override = argv[argi + 1];
+			argi += 2;
+			continue;
+		}
+
 		if (strncmp(argv[argi], "--", 2) == 0)
 		{
 			print_usage(argv[0]);
@@ -476,7 +617,7 @@ int main(int argc, char** argv)
 	}
 
 	for (i = argi; i < argc; i++)
-		failed |= print_vmc_info(argv[i], has_slot, slot, sealedkey_override, list_slots, fingerprint);
+		failed |= print_vmc_info(argv[i], has_slot, slot, sealedkey_override, rawkey_override, list_slots, fingerprint);
 
 	return failed ? 2 : 0;
 }

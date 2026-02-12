@@ -19,7 +19,7 @@
 
 static void print_usage(const char* argv0)
 {
-	fprintf(stderr, "Usage: %s [--slot N] [--list-slots] [--fingerprint] [--dump-slot N OUTFILE] [--sealedkey PATH] [--rawkey PATH] <memory-card.vmc> [more...]\n", argv0);
+	fprintf(stderr, "Usage: %s [--slot N] [--list-slots] [--fingerprint] [--dump-slot N OUTFILE] [--decrypt OUTFILE] [--sealedkey PATH] [--rawkey PATH] <memory-card.vmc> [more...]\n", argv0);
 }
 
 static uint64_t fnv1a64(const uint8_t* data, size_t len);
@@ -687,6 +687,124 @@ static int print_vmc_info(const char* path, int has_slot, uint32_t slot, const c
 	return 0;
 }
 
+static int decrypt_vmc_file(const char* input_path, const char* output_path, const raw_key_blob_t* raw_key)
+{
+	vmc_info_t info;
+	FILE* in;
+	FILE* out;
+	uint8_t buf[PS1_RAW_SIZE];
+	uint8_t header[PS1HD_HEADER_SIZE];
+	uint32_t i;
+
+	if (!input_path || !output_path || !raw_key || !raw_key->valid)
+		return 0;
+
+	if (!vmc_get_info(input_path, &info))
+	{
+		fprintf(stderr, "%s: failed to parse VMC file\n", input_path);
+		return 0;
+	}
+
+	in = fopen(input_path, "rb");
+	if (!in)
+	{
+		fprintf(stderr, "%s: failed to open input\n", input_path);
+		return 0;
+	}
+
+	out = fopen(output_path, "wb");
+	if (!out)
+	{
+		fclose(in);
+		fprintf(stderr, "%s: failed to open output %s\n", input_path, output_path);
+		return 0;
+	}
+
+	if (info.embedded_slots > 0)
+	{
+		if (fread(header, 1, sizeof(header), in) != sizeof(header))
+		{
+			fclose(in);
+			fclose(out);
+			fprintf(stderr, "%s: failed to read PS1HD header\n", input_path);
+			return 0;
+		}
+
+		if (fwrite(header, 1, sizeof(header), out) != sizeof(header))
+		{
+			fclose(in);
+			fclose(out);
+			fprintf(stderr, "%s: failed to write PS1HD header\n", output_path);
+			return 0;
+		}
+
+		for (i = 0; i < info.embedded_slots; i++)
+		{
+			if (fread(buf, 1, sizeof(buf), in) != sizeof(buf))
+			{
+				fclose(in);
+				fclose(out);
+				fprintf(stderr, "%s: failed to read slot %u\n", input_path, i);
+				return 0;
+			}
+
+			if (!maybe_transform_slot_with_raw_key(buf, i, raw_key))
+			{
+				fclose(in);
+				fclose(out);
+				fprintf(stderr, "%s: failed to decrypt slot %u with provided raw key\n", input_path, i);
+				return 0;
+			}
+
+			if (fwrite(buf, 1, sizeof(buf), out) != sizeof(buf))
+			{
+				fclose(in);
+				fclose(out);
+				fprintf(stderr, "%s: failed to write slot %u\n", output_path, i);
+				return 0;
+			}
+		}
+	}
+	else if (info.system == VMC_SYSTEM_PS1 && info.raw_size == PS1_RAW_SIZE)
+	{
+		if (fread(buf, 1, sizeof(buf), in) != sizeof(buf))
+		{
+			fclose(in);
+			fclose(out);
+			fprintf(stderr, "%s: failed to read raw PS1 VMC\n", input_path);
+			return 0;
+		}
+
+		if (!maybe_transform_slot_with_raw_key(buf, 0, raw_key))
+		{
+			fclose(in);
+			fclose(out);
+			fprintf(stderr, "%s: failed to decrypt raw PS1 VMC with provided raw key\n", input_path);
+			return 0;
+		}
+
+		if (fwrite(buf, 1, sizeof(buf), out) != sizeof(buf))
+		{
+			fclose(in);
+			fclose(out);
+			fprintf(stderr, "%s: failed to write decrypted output\n", output_path);
+			return 0;
+		}
+	}
+	else
+	{
+		fclose(in);
+		fclose(out);
+		fprintf(stderr, "%s: --decrypt currently supports PS1 raw cards and PS1HD container VMCs\n", input_path);
+		return 0;
+	}
+
+	fclose(in);
+	fclose(out);
+	printf("Decrypted VMC written to %s\n", output_path);
+	return 1;
+}
+
 int main(int argc, char** argv)
 {
 	int i;
@@ -696,9 +814,11 @@ int main(int argc, char** argv)
 	int list_slots = 0;
 	int fingerprint = 0;
 	int has_dump_slot = 0;
+	int has_decrypt_out = 0;
 	uint32_t slot = 0;
 	uint32_t dump_slot = 0;
 	const char* dump_outfile = NULL;
+	const char* decrypt_outfile = NULL;
 	const char* sealedkey_override = NULL;
 	const char* rawkey_override = NULL;
 	const char* input_paths[argc > 0 ? (size_t) argc : 1];
@@ -764,6 +884,20 @@ int main(int argc, char** argv)
 			dump_outfile = argv[argi + 2];
 			has_dump_slot = 1;
 			argi += 3;
+			continue;
+		}
+
+		if (strcmp(argv[argi], "--decrypt") == 0)
+		{
+			if (argi + 1 >= argc)
+			{
+				print_usage(argv[0]);
+				return 1;
+			}
+
+			decrypt_outfile = argv[argi + 1];
+			has_decrypt_out = 1;
+			argi += 2;
 			continue;
 		}
 
@@ -898,6 +1032,32 @@ int main(int argc, char** argv)
 
 			printf("Dumped slot %u to %s (%u bytes)\n", dump_slot, dump_outfile, PS1_RAW_SIZE);
 		}
+	}
+
+	if (has_decrypt_out)
+	{
+		raw_key_blob_t raw_key;
+
+		if (input_count != 1)
+		{
+			fprintf(stderr, "--decrypt accepts exactly one input VMC file\n");
+			return 1;
+		}
+
+		if (!rawkey_override)
+		{
+			fprintf(stderr, "--decrypt requires --rawkey PATH\n");
+			return 1;
+		}
+
+		if (!load_raw_key(rawkey_override, &raw_key))
+		{
+			fprintf(stderr, "Failed to load raw key from %s\n", rawkey_override);
+			return 1;
+		}
+
+		if (!decrypt_vmc_file(input_paths[0], decrypt_outfile, &raw_key))
+			return 1;
 	}
 
 	for (i = 0; i < input_count; i++)

@@ -8,6 +8,8 @@
 #define PS1CARD_RAW_SIZE 131072
 #define PS2_MAGIC "Sony PS2 Memory Card Format "
 #define PS1_BLANK_CHECK_SIZE 4096
+#define PS1_EMBED_SCAN_LIMIT (16 * 1024 * 1024)
+#define PS1_EMBED_SCAN_CHUNK (64 * 1024)
 
 static uint16_t read_le16(const uint8_t* ptr)
 {
@@ -132,6 +134,158 @@ static int detect_ps1hd_vmc_container(const uint8_t* hdr, size_t hdr_size, uint6
 	return 0;
 }
 
+static int validate_embedded_ps1_signature(FILE* fp, uint64_t file_size, uint64_t sig_offset)
+{
+	uint8_t block[0x200];
+	size_t read;
+	size_t i;
+	unsigned non_zero = 0;
+
+	if (!fp || sig_offset + sizeof(block) > file_size)
+		return 0;
+
+	if (fseeko(fp, (off_t) sig_offset, SEEK_SET) < 0)
+		return 0;
+
+	read = fread(block, 1, sizeof(block), fp);
+	if (read != sizeof(block))
+		return 0;
+
+	if (block[0] != 'M' || block[1] != 'C')
+		return 0;
+
+	for (i = 0; i < read; i++)
+	{
+		if (block[i] != 0x00)
+			non_zero++;
+	}
+
+	return (non_zero > 16);
+}
+
+static int validate_embedded_ps1_region(FILE* fp, uint64_t file_size, uint64_t card_offset)
+{
+	uint8_t block[0x1000];
+	uint32_t hist[256] = {0};
+	size_t read;
+	size_t i;
+	uint32_t max_count = 0;
+	unsigned non_zero = 0;
+	unsigned non_ff = 0;
+
+	if (!fp || card_offset + PS1CARD_RAW_SIZE > file_size)
+		return 0;
+
+	if (fseeko(fp, (off_t) card_offset, SEEK_SET) < 0)
+		return 0;
+
+	read = fread(block, 1, sizeof(block), fp);
+	if (read != sizeof(block))
+		return 0;
+
+	for (i = 0; i < read; i++)
+	{
+		hist[block[i]]++;
+		if (block[i] != 0x00)
+			non_zero++;
+		if (block[i] != 0xFF)
+			non_ff++;
+	}
+
+	for (i = 0; i < 256; i++)
+	{
+		if (hist[i] > max_count)
+			max_count = hist[i];
+	}
+
+	/*
+	 * Uniform/random-like 4 KiB data has byte frequencies clustered around
+	 * ~16 occurrences per symbol. A real PS1 memory-card region is more
+	 * structured and should have noticeable peaks.
+	 */
+	if (max_count < 256)
+		return 0;
+
+	if (non_zero < 32 || non_ff < 32)
+		return 0;
+
+	return 1;
+}
+
+static int find_embedded_ps1_raw(FILE* fp, uint64_t file_size, uint64_t* out_off)
+{
+	uint8_t chunk[PS1_EMBED_SCAN_CHUNK + 1];
+	uint64_t scan_limit;
+	uint64_t base = 0;
+	int has_prev = 0;
+
+	if (!fp || !out_off || file_size < PS1CARD_RAW_SIZE)
+		return 0;
+
+	scan_limit = (file_size < PS1_EMBED_SCAN_LIMIT) ? file_size : PS1_EMBED_SCAN_LIMIT;
+
+	if (fseeko(fp, 0, SEEK_SET) < 0)
+		return 0;
+
+	while (base < scan_limit)
+	{
+		size_t to_read;
+		size_t got;
+		size_t scan_len;
+		size_t i;
+
+		to_read = PS1_EMBED_SCAN_CHUNK;
+		if (base + to_read > scan_limit)
+			to_read = (size_t) (scan_limit - base);
+
+		got = fread(chunk + (has_prev ? 1 : 0), 1, to_read, fp);
+		if (got != to_read)
+			return 0;
+
+		scan_len = got + (has_prev ? 1 : 0);
+
+		for (i = 0; i + 1 < scan_len; i++)
+		{
+			uint64_t sig_off;
+
+			if (chunk[i] != 'M' || chunk[i + 1] != 'C')
+				continue;
+
+			sig_off = base - (has_prev ? 1 : 0) + i;
+
+			if (sig_off + PS1CARD_RAW_SIZE <= file_size &&
+				validate_embedded_ps1_signature(fp, file_size, sig_off) &&
+				validate_embedded_ps1_region(fp, file_size, sig_off))
+			{
+				*out_off = sig_off;
+				return 1;
+			}
+
+			if (sig_off >= 0x80 &&
+				(sig_off - 0x80) + PS1CARD_RAW_SIZE <= file_size &&
+				validate_embedded_ps1_signature(fp, file_size, sig_off) &&
+				validate_embedded_ps1_region(fp, file_size, sig_off - 0x80))
+			{
+				*out_off = sig_off - 0x80;
+				return 1;
+			}
+		}
+
+		if (scan_len > 0)
+		{
+			chunk[0] = chunk[scan_len - 1];
+			has_prev = 1;
+		}
+
+		base += got;
+
+		if (fseeko(fp, (off_t) base, SEEK_SET) < 0)
+			return 0;
+	}
+
+	return 0;
+}
+
 const char* vmc_system_name(int system)
 {
 	switch (system)
@@ -157,6 +311,7 @@ int vmc_get_info(const char* path, vmc_info_t* info)
 	memset(info, 0, sizeof(*info));
 	info->format = "Unknown";
 	info->ps1_signature = VMC_PS1_SIGNATURE_NA;
+	info->container = NULL;
 
 	fp = fopen(path, "rb");
 	if (!fp)
@@ -211,6 +366,24 @@ int vmc_get_info(const char* path, vmc_info_t* info)
 	{
 		fclose(fp);
 		return 1;
+	}
+
+	{
+		uint64_t embedded_offset;
+
+		if (find_embedded_ps1_raw(fp, info->file_size, &embedded_offset))
+		{
+			info->system = VMC_SYSTEM_PS1;
+			info->format = "PS1 Memory Card";
+			info->container = "Embedded/Container VMC";
+			info->raw_size = PS1CARD_RAW_SIZE;
+			info->embedded_offset = embedded_offset;
+			info->embedded_size = PS1CARD_RAW_SIZE;
+			info->ps1_signature = VMC_PS1_SIGNATURE_PRESENT;
+
+			fclose(fp);
+			return 1;
+		}
 	}
 
 	if (detect_ps1hd_vmc_container(hdr, n, info->file_size, info))

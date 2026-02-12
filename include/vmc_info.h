@@ -16,12 +16,15 @@ typedef struct vmc_info {
 	int system;
 	uint64_t file_size;
 	uint32_t raw_size;
+	uint64_t embedded_offset;
+	uint32_t embedded_size;
 	uint32_t pagesize;
 	uint32_t pages_per_cluster;
 	uint32_t clusters_per_card;
 	int has_ecc;
 	int ps1_signature;
 	const char* format;
+	const char* container;
 } vmc_info_t;
 
 int vmc_get_info(const char* path, vmc_info_t* info);

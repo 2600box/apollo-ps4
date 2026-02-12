@@ -34,6 +34,8 @@ static int print_vmc_info(const char* path)
 	}
 	else if (info.system == VMC_SYSTEM_PS1)
 	{
+		printf("Raw size: %u bytes\n", info.raw_size);
+
 		switch (info.ps1_signature)
 		{
 			case VMC_PS1_SIGNATURE_PRESENT:
@@ -47,6 +49,15 @@ static int print_vmc_info(const char* path)
 				break;
 			default:
 				break;
+		}
+
+		if (info.container)
+			printf("Container: %s\n", info.container);
+
+		if (info.embedded_size > 0)
+		{
+			printf("Embedded offset: %" PRIu64 "\n", info.embedded_offset);
+			printf("Embedded size: %u bytes\n", info.embedded_size);
 		}
 	}
 

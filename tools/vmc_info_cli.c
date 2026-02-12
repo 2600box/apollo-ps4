@@ -989,6 +989,7 @@ int main(int argc, char** argv)
 		if (raw_key_loaded)
 		{
 			FILE* out;
+			int transformed;
 
 			if (!vmc_read_embedded_slot(vmc_path, dump_slot, slot_buf, sizeof(slot_buf)))
 			{
@@ -996,11 +997,7 @@ int main(int argc, char** argv)
 				return 1;
 			}
 
-			if (!maybe_transform_slot_with_raw_key(slot_buf, dump_slot, &raw_key))
-			{
-				fprintf(stderr, "%s: failed to transform slot %u with provided raw key\n", vmc_path, dump_slot);
-				return 1;
-			}
+			transformed = maybe_transform_slot_with_raw_key(slot_buf, dump_slot, &raw_key);
 
 			out = fopen(dump_outfile, "wb");
 			if (!out)
@@ -1017,7 +1014,10 @@ int main(int argc, char** argv)
 			}
 
 			fclose(out);
-			printf("Dumped slot %u to %s (%u bytes, raw-key transform applied)\n", dump_slot, dump_outfile, PS1_RAW_SIZE);
+			if (transformed)
+				printf("Dumped slot %u to %s (%u bytes, raw-key transform applied)\n", dump_slot, dump_outfile, PS1_RAW_SIZE);
+			else
+				printf("Dumped slot %u to %s (%u bytes, raw-key transform could not be validated; wrote raw slot bytes)\n", dump_slot, dump_outfile, PS1_RAW_SIZE);
 		}
 		else
 		{

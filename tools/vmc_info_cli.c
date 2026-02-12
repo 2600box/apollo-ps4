@@ -258,9 +258,9 @@ static void build_key_variant(uint8_t out[32], const uint8_t in[32], int key_mod
 static int maybe_transform_slot_with_raw_key(uint8_t* slot_data, uint32_t slot_index, const raw_key_blob_t* raw_key)
 {
 	uint8_t candidate[PS1_RAW_SIZE];
+	uint8_t best_candidate[PS1_RAW_SIZE];
 	uint8_t key_variant[32];
 	int best_score = -1;
-	int transformed = 0;
 	int mode;
 	int key_mode_start;
 	int key_mode_end;
@@ -303,14 +303,19 @@ static int maybe_transform_slot_with_raw_key(uint8_t* slot_data, uint32_t slot_i
 
 			if (score > best_score)
 			{
-				memcpy(slot_data, candidate, sizeof(candidate));
+				memcpy(best_candidate, candidate, sizeof(best_candidate));
 				best_score = score;
-				transformed = 1;
 			}
 		}
 	}
 
-	return transformed && best_score >= 12;
+	if (best_score >= 12)
+	{
+		memcpy(slot_data, best_candidate, sizeof(best_candidate));
+		return 1;
+	}
+
+	return 0;
 }
 
 static uint64_t fnv1a64(const uint8_t* data, size_t len)
@@ -696,6 +701,8 @@ int main(int argc, char** argv)
 	const char* dump_outfile = NULL;
 	const char* sealedkey_override = NULL;
 	const char* rawkey_override = NULL;
+	const char* input_paths[argc > 0 ? (size_t) argc : 1];
+	int input_count = 0;
 
 	if (argc < 2)
 	{
@@ -705,12 +712,18 @@ int main(int argc, char** argv)
 
 	while (argi < argc)
 	{
+		if (strcmp(argv[argi], "--help") == 0 || strcmp(argv[argi], "-h") == 0)
+		{
+			print_usage(argv[0]);
+			return 0;
+		}
+
 		if (strcmp(argv[argi], "--slot") == 0)
 		{
 			char* end;
 			unsigned long parsed;
 
-			if (argi + 2 >= argc)
+			if (argi + 1 >= argc)
 			{
 				print_usage(argv[0]);
 				return 1;
@@ -734,7 +747,7 @@ int main(int argc, char** argv)
 			char* end;
 			unsigned long parsed;
 
-			if (argi + 3 >= argc)
+			if (argi + 2 >= argc)
 			{
 				print_usage(argv[0]);
 				return 1;
@@ -770,7 +783,7 @@ int main(int argc, char** argv)
 
 		if (strcmp(argv[argi], "--sealedkey") == 0)
 		{
-			if (argi + 2 >= argc)
+			if (argi + 1 >= argc)
 			{
 				print_usage(argv[0]);
 				return 1;
@@ -783,7 +796,7 @@ int main(int argc, char** argv)
 
 		if (strcmp(argv[argi], "--rawkey") == 0)
 		{
-			if (argi + 2 >= argc)
+			if (argi + 1 >= argc)
 			{
 				print_usage(argv[0]);
 				return 1;
@@ -800,10 +813,11 @@ int main(int argc, char** argv)
 			return 1;
 		}
 
-		break;
+		input_paths[input_count++] = argv[argi];
+		argi += 1;
 	}
 
-	if (argi >= argc)
+	if (input_count == 0)
 	{
 		print_usage(argv[0]);
 		return 1;
@@ -817,13 +831,13 @@ int main(int argc, char** argv)
 		uint8_t slot_buf[PS1_RAW_SIZE];
 		int raw_key_loaded;
 
-		if ((argc - argi) != 1)
+		if (input_count != 1)
 		{
 			fprintf(stderr, "--dump-slot accepts exactly one input VMC file\n");
 			return 1;
 		}
 
-		vmc_path = argv[argi];
+		vmc_path = input_paths[0];
 		if (!vmc_get_info(vmc_path, &info) || info.embedded_slots == 0)
 		{
 			fprintf(stderr, "%s: --dump-slot requires a PS1HD container VMC\n", vmc_path);
@@ -848,7 +862,11 @@ int main(int argc, char** argv)
 				return 1;
 			}
 
-			(void) maybe_transform_slot_with_raw_key(slot_buf, dump_slot, &raw_key);
+			if (!maybe_transform_slot_with_raw_key(slot_buf, dump_slot, &raw_key))
+			{
+				fprintf(stderr, "%s: failed to transform slot %u with provided raw key\n", vmc_path, dump_slot);
+				return 1;
+			}
 
 			out = fopen(dump_outfile, "wb");
 			if (!out)
@@ -882,8 +900,8 @@ int main(int argc, char** argv)
 		}
 	}
 
-	for (i = argi; i < argc; i++)
-		failed |= print_vmc_info(argv[i], has_slot, slot, sealedkey_override, rawkey_override, list_slots, fingerprint);
+	for (i = 0; i < input_count; i++)
+		failed |= print_vmc_info(input_paths[i], has_slot, slot, sealedkey_override, rawkey_override, list_slots, fingerprint);
 
 	return failed ? 2 : 0;
 }

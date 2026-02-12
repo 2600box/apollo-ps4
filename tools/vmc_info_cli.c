@@ -25,6 +25,7 @@ static void print_usage(const char* argv0)
 static uint64_t fnv1a64(const uint8_t* data, size_t len);
 static int buffer_looks_high_entropy(const uint8_t* data, size_t len);
 static int slot_has_signature(const uint8_t* slot_data);
+static int score_ps1_slot_layout(const uint8_t* slot_data);
 
 static const size_t g_raw_key_sizes[] = {16, 32, 48};
 
@@ -227,41 +228,89 @@ static int decrypt_slot_xts(const uint8_t* in, uint8_t* out, size_t len, const u
 	return 1;
 }
 
+static void build_key_variant(uint8_t out[32], const uint8_t in[32], int key_mode)
+{
+	int i;
+
+	switch (key_mode)
+	{
+		case 1:
+			memcpy(out, in + 16, 16);
+			memcpy(out + 16, in, 16);
+			break;
+		case 2:
+			for (i = 0; i < 16; i++)
+			{
+				out[i] = in[15 - i];
+				out[16 + i] = in[31 - i];
+			}
+			break;
+		case 3:
+			for (i = 0; i < 32; i++)
+				out[i] = in[31 - i];
+			break;
+		default:
+			memcpy(out, in, 32);
+			break;
+	}
+}
+
 static int maybe_transform_slot_with_raw_key(uint8_t* slot_data, uint32_t slot_index, const raw_key_blob_t* raw_key)
 {
 	uint8_t candidate[PS1_RAW_SIZE];
+	uint8_t key_variant[32];
 	int best_score = -1;
 	int transformed = 0;
 	int mode;
+	int key_mode_start;
+	int key_mode_end;
+	int key_mode;
 
 	if (!slot_data || !raw_key || !raw_key->valid)
 		return 0;
 
-	for (mode = 0; mode < 4; mode++)
+	if (raw_key->len == 32)
 	{
-		uint64_t sector_base = (mode & 1) ? (((uint64_t) PS1HD_HEADER_SIZE / 512) + ((uint64_t) slot_index * (PS1_RAW_SIZE / 512))) : ((uint64_t) slot_index * (PS1_RAW_SIZE / 512));
-		int tweak_be = (mode & 2) ? 1 : 0;
-		int score = 0;
+		key_mode_start = 0;
+		key_mode_end = 4;
+	}
+	else
+	{
+		key_mode_start = 0;
+		key_mode_end = 1;
+	}
 
-		if (!decrypt_slot_xts(slot_data, candidate, sizeof(candidate), raw_key->data, raw_key->len, sector_base, tweak_be))
-			continue;
+	for (key_mode = key_mode_start; key_mode < key_mode_end; key_mode++)
+	{
+		if (raw_key->len == 32)
+			build_key_variant(key_variant, raw_key->data, key_mode);
 
-		if (slot_has_signature(candidate))
-			score += 4;
-		if (!buffer_looks_high_entropy(candidate, 4096))
-			score += 2;
-		if (candidate[0] == 'M' && candidate[1] == 'C')
-			score += 2;
-
-		if (score > best_score)
+		for (mode = 0; mode < 4; mode++)
 		{
-			memcpy(slot_data, candidate, sizeof(candidate));
-			best_score = score;
-			transformed = 1;
+			uint64_t sector_base = (mode & 1) ? (((uint64_t) PS1HD_HEADER_SIZE / 512) + ((uint64_t) slot_index * (PS1_RAW_SIZE / 512))) : ((uint64_t) slot_index * (PS1_RAW_SIZE / 512));
+			int tweak_be = (mode & 2) ? 1 : 0;
+			int score = 0;
+			const uint8_t* key_data = (raw_key->len == 32) ? key_variant : raw_key->data;
+
+			if (!decrypt_slot_xts(slot_data, candidate, sizeof(candidate), key_data, raw_key->len, sector_base, tweak_be))
+				continue;
+
+			score += score_ps1_slot_layout(candidate);
+			if (!buffer_looks_high_entropy(candidate, 4096))
+				score += 2;
+			if (candidate[0] == 'M' && candidate[1] == 'C')
+				score += 2;
+
+			if (score > best_score)
+			{
+				memcpy(slot_data, candidate, sizeof(candidate));
+				best_score = score;
+				transformed = 1;
+			}
 		}
 	}
 
-	return transformed && best_score >= 4;
+	return transformed && best_score >= 12;
 }
 
 static uint64_t fnv1a64(const uint8_t* data, size_t len)
@@ -324,6 +373,46 @@ static int slot_has_signature(const uint8_t* slot_data)
 		return 1;
 
 	return 0;
+}
+
+static int score_ps1_slot_layout(const uint8_t* slot_data)
+{
+	int i;
+	int score = 0;
+	int used_entries = 0;
+	int plausible_entries = 0;
+
+	if (!slot_data)
+		return 0;
+
+	if (slot_has_signature(slot_data))
+		score += 8;
+
+	for (i = 0; i < PS1_SLOT_COUNT; i++)
+	{
+		const uint8_t* dir = slot_data + PS1_DIR_OFFSET + (i * PS1_DIR_ENTRY_SIZE);
+		uint8_t type = dir[0];
+		uint32_t size_bytes;
+
+		if (type == 0xA0 || type == 0xA1 || type == 0xA2 || type == 0x50 || type == 0x51 || type == 0x52 || type == 0x53)
+			score += 1;
+
+		if (!(type == 0x51 || type == 0xA1))
+			continue;
+
+		used_entries++;
+		size_bytes = (uint32_t) dir[4] | ((uint32_t) dir[5] << 8) | ((uint32_t) dir[6] << 16);
+		if (size_bytes >= PS1_BLOCK_SIZE && size_bytes <= (PS1_SLOT_COUNT * PS1_BLOCK_SIZE) && (size_bytes % PS1_BLOCK_SIZE) == 0)
+		{
+			plausible_entries++;
+			score += 3;
+		}
+	}
+
+	if (used_entries > 0 && plausible_entries == used_entries)
+		score += 4;
+
+	return score;
 }
 
 static void copy_ps1_text(char* out, size_t out_len, const uint8_t* src, size_t src_len)
@@ -724,6 +813,9 @@ int main(int argc, char** argv)
 	{
 		vmc_info_t info;
 		const char* vmc_path;
+		raw_key_blob_t raw_key;
+		uint8_t slot_buf[PS1_RAW_SIZE];
+		int raw_key_loaded;
 
 		if ((argc - argi) != 1)
 		{
@@ -744,13 +836,50 @@ int main(int argc, char** argv)
 			return 1;
 		}
 
-		if (!vmc_dump_embedded_slot(vmc_path, dump_slot, dump_outfile))
-		{
-			fprintf(stderr, "%s: failed to dump slot %u to %s\n", vmc_path, dump_slot, dump_outfile);
-			return 1;
-		}
+		raw_key_loaded = load_raw_key(rawkey_override, &raw_key);
 
-		printf("Dumped slot %u to %s (%u bytes)\n", dump_slot, dump_outfile, PS1_RAW_SIZE);
+		if (raw_key_loaded)
+		{
+			FILE* out;
+
+			if (!vmc_read_embedded_slot(vmc_path, dump_slot, slot_buf, sizeof(slot_buf)))
+			{
+				fprintf(stderr, "%s: failed to read slot %u\n", vmc_path, dump_slot);
+				return 1;
+			}
+
+			(void) maybe_transform_slot_with_raw_key(slot_buf, dump_slot, &raw_key);
+
+			out = fopen(dump_outfile, "wb");
+			if (!out)
+			{
+				fprintf(stderr, "%s: failed to open %s\n", vmc_path, dump_outfile);
+				return 1;
+			}
+
+			if (fwrite(slot_buf, 1, sizeof(slot_buf), out) != sizeof(slot_buf))
+			{
+				fclose(out);
+				fprintf(stderr, "%s: failed to write %s\n", vmc_path, dump_outfile);
+				return 1;
+			}
+
+			fclose(out);
+			printf("Dumped slot %u to %s (%u bytes, raw-key transform applied)\n", dump_slot, dump_outfile, PS1_RAW_SIZE);
+		}
+		else
+		{
+			if (rawkey_override)
+				fprintf(stderr, "Warning: unable to load raw key from %s; dumping slot without transform\n", rawkey_override);
+
+			if (!vmc_dump_embedded_slot(vmc_path, dump_slot, dump_outfile))
+			{
+				fprintf(stderr, "%s: failed to dump slot %u to %s\n", vmc_path, dump_slot, dump_outfile);
+				return 1;
+			}
+
+			printf("Dumped slot %u to %s (%u bytes)\n", dump_slot, dump_outfile, PS1_RAW_SIZE);
+		}
 	}
 
 	for (i = argi; i < argc; i++)

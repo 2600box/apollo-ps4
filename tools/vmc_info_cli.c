@@ -3,16 +3,157 @@
 #include <stdint.h>
 #include <string.h>
 #include <inttypes.h>
+#include <ctype.h>
 
 #include "vmc_info.h"
 
 #define SLOT_SUMMARY_LIMIT 10
 #define PS1HD_HEADER_SIZE 0x8000
 #define PS1_RAW_SIZE 0x20000
+#define PS1_BLOCK_SIZE 8192
+#define PS1_SLOT_COUNT 15
+#define PS1_DIR_ENTRY_SIZE 128
+#define PS1_DIR_OFFSET 0x80
 
 static void print_usage(const char* argv0)
 {
-	fprintf(stderr, "Usage: %s [--slot N] [--sealedkey PATH] <memory-card.vmc> [more...]\n", argv0);
+	fprintf(stderr, "Usage: %s [--slot N] [--list-slots] [--fingerprint] [--dump-slot N OUTFILE] [--sealedkey PATH] <memory-card.vmc> [more...]\n", argv0);
+}
+
+static uint64_t fnv1a64(const uint8_t* data, size_t len)
+{
+	uint64_t hash = 1469598103934665603ULL;
+	size_t i;
+
+	for (i = 0; i < len; i++)
+	{
+		hash ^= data[i];
+		hash *= 1099511628211ULL;
+	}
+
+	return hash;
+}
+
+static int buffer_looks_high_entropy(const uint8_t* data, size_t len)
+{
+	uint32_t hist[256] = {0};
+	size_t i;
+	unsigned distinct = 0;
+	unsigned zeros_or_ff = 0;
+
+	if (!data || len == 0)
+		return 0;
+
+	for (i = 0; i < len; i++)
+	{
+		hist[data[i]]++;
+		if (data[i] == 0x00 || data[i] == 0xFF)
+			zeros_or_ff++;
+	}
+
+	for (i = 0; i < 256; i++)
+	{
+		if (hist[i] != 0)
+			distinct++;
+	}
+
+	return (distinct > 200 && zeros_or_ff * 50 < len);
+}
+
+static void print_first16_hex(const uint8_t* data)
+{
+	size_t i;
+
+	for (i = 0; i < 16; i++)
+		printf("%02x", data[i]);
+}
+
+static int slot_has_signature(const uint8_t* slot_data)
+{
+	if (!slot_data)
+		return 0;
+
+	if (slot_data[0] == 'M' && slot_data[1] == 'C')
+		return 1;
+
+	if (slot_data[0x80] == 'M' && slot_data[0x81] == 'C')
+		return 1;
+
+	return 0;
+}
+
+static void copy_ps1_text(char* out, size_t out_len, const uint8_t* src, size_t src_len)
+{
+	size_t i;
+	size_t j = 0;
+
+	if (!out || out_len == 0)
+		return;
+
+	for (i = 0; i < src_len && j + 1 < out_len; i++)
+	{
+		uint8_t ch = src[i];
+
+		if (ch == 0x00)
+			break;
+
+		if (isprint(ch) || ch == ' ')
+			out[j++] = (char) ch;
+		else if (ch == '\n' || ch == '\r' || ch == '\t')
+			out[j++] = ' ';
+		else
+			out[j++] = '.';
+	}
+
+	out[j] = '\0';
+}
+
+static void print_slot_save_details(const uint8_t* slot_data, uint32_t slot_number)
+{
+	int i;
+	int any = 0;
+
+	printf("slot %u saves:\n", slot_number);
+
+	for (i = 0; i < PS1_SLOT_COUNT; i++)
+	{
+		const uint8_t* dir = slot_data + PS1_DIR_OFFSET + (i * PS1_DIR_ENTRY_SIZE);
+		uint8_t type = dir[0];
+
+		if (!(type == 0x51 || type == 0xA1))
+			continue;
+
+		{
+			uint32_t size_bytes = (uint32_t) dir[4] | ((uint32_t) dir[5] << 8) | ((uint32_t) dir[6] << 16);
+			uint32_t blocks = size_bytes / PS1_BLOCK_SIZE;
+			char save_name[21] = {0};
+			char product[11] = {0};
+			char identifier[9] = {0};
+			char title[65] = {0};
+			const uint8_t* save_block = slot_data + ((size_t) (i + 1) * PS1_BLOCK_SIZE);
+
+			memcpy(save_name, dir + 10, 20);
+			save_name[20] = '\0';
+			memcpy(product, dir + 12, 10);
+			product[10] = '\0';
+			memcpy(identifier, dir + 22, 8);
+			identifier[8] = '\0';
+			copy_ps1_text(title, sizeof(title), save_block + 4, 64);
+
+			printf("  block %d: name=%s title=%s product=%s id=%s blocks=%u status=%s\n",
+				i,
+				save_name[0] ? save_name : "<empty>",
+				title[0] ? title : "<unreadable>",
+				product[0] ? product : "<n/a>",
+				identifier[0] ? identifier : "<n/a>",
+				blocks,
+				(type == 0x51) ? "active" : "deleted");
+			any = 1;
+		}
+	}
+
+	if (!any)
+		printf("  <no active save headers detected>\n");
 }
 
 static void print_ps1_signature(const vmc_info_t* info)
@@ -36,7 +177,7 @@ static void print_ps1_signature(const vmc_info_t* info)
 	}
 }
 
-static int print_slot_summary(const char* path, uint32_t slots, int encrypted)
+static int print_slot_summary(const char* path, uint32_t slots, int encrypted, int show_fingerprint)
 {
 	uint32_t i;
 	uint32_t limit = slots;
@@ -67,10 +208,49 @@ static int print_slot_summary(const char* path, uint32_t slots, int encrypted)
 	if (slots > limit)
 		printf("...\n");
 
+	for (i = 0; i < slots; i++)
+	{
+		uint8_t slot_buf[PS1_RAW_SIZE];
+
+		if (!vmc_read_embedded_slot(path, i, slot_buf, sizeof(slot_buf)))
+			continue;
+
+		print_slot_save_details(slot_buf, i);
+	}
+
+	if (show_fingerprint)
+	{
+		printf("Fingerprints (non-cryptographic hash: FNV-1a 64-bit):\n");
+		for (i = 0; i < slots; i++)
+		{
+			uint8_t slot_buf[PS1_RAW_SIZE];
+			uint64_t hash;
+			int signature_present;
+			int high_entropy;
+
+			if (!vmc_read_embedded_slot(path, i, slot_buf, sizeof(slot_buf)))
+			{
+				printf("slot %u: <read error>\n", i);
+				continue;
+			}
+
+			hash = fnv1a64(slot_buf, sizeof(slot_buf));
+			signature_present = slot_has_signature(slot_buf);
+			high_entropy = buffer_looks_high_entropy(slot_buf, 4096);
+
+			printf("slot %u: first16=", i);
+			print_first16_hex(slot_buf);
+			printf("  hash64=%016" PRIx64 "  signature=%s  entropy=%s\n",
+				hash,
+				signature_present ? "present" : "missing",
+				high_entropy ? "high" : "low");
+		}
+	}
+
 	return 0;
 }
 
-static int print_vmc_info(const char* path, int has_slot, uint32_t slot, const char* sealedkey_override)
+static int print_vmc_info(const char* path, int has_slot, uint32_t slot, const char* sealedkey_override, int explicit_list_slots, int fingerprint)
 {
 	vmc_info_t info;
 	pfs_sealedkey_info_t sk_info;
@@ -100,8 +280,10 @@ static int print_vmc_info(const char* path, int has_slot, uint32_t slot, const c
 	{
 		printf("Raw size: %u bytes\n", info.raw_size);
 
+		(void) explicit_list_slots;
+
 		if (!has_slot && info.embedded_slots > 0)
-			print_slot_summary(path, info.embedded_slots, info.slot_payload_suspect_encrypted);
+			print_slot_summary(path, info.embedded_slots, info.slot_payload_suspect_encrypted, fingerprint);
 
 		if (info.embedded_slots > 0)
 		{
@@ -153,7 +335,12 @@ int main(int argc, char** argv)
 	int failed = 0;
 	int argi = 1;
 	int has_slot = 0;
+	int list_slots = 0;
+	int fingerprint = 0;
+	int has_dump_slot = 0;
 	uint32_t slot = 0;
+	uint32_t dump_slot = 0;
+	const char* dump_outfile = NULL;
 	const char* sealedkey_override = NULL;
 
 	if (argc < 2)
@@ -188,6 +375,45 @@ int main(int argc, char** argv)
 			continue;
 		}
 
+		if (strcmp(argv[argi], "--dump-slot") == 0)
+		{
+			char* end;
+			unsigned long parsed;
+
+			if (argi + 3 >= argc)
+			{
+				print_usage(argv[0]);
+				return 1;
+			}
+
+			parsed = strtoul(argv[argi + 1], &end, 10);
+			if (*argv[argi + 1] == '\0' || *end != '\0' || parsed > UINT32_MAX)
+			{
+				fprintf(stderr, "Invalid dump slot value: %s\n", argv[argi + 1]);
+				return 1;
+			}
+
+			dump_slot = (uint32_t) parsed;
+			dump_outfile = argv[argi + 2];
+			has_dump_slot = 1;
+			argi += 3;
+			continue;
+		}
+
+		if (strcmp(argv[argi], "--list-slots") == 0)
+		{
+			list_slots = 1;
+			argi += 1;
+			continue;
+		}
+
+		if (strcmp(argv[argi], "--fingerprint") == 0)
+		{
+			fingerprint = 1;
+			argi += 1;
+			continue;
+		}
+
 		if (strcmp(argv[argi], "--sealedkey") == 0)
 		{
 			if (argi + 2 >= argc)
@@ -216,8 +442,41 @@ int main(int argc, char** argv)
 		return 1;
 	}
 
+	if (has_dump_slot)
+	{
+		vmc_info_t info;
+		const char* vmc_path;
+
+		if ((argc - argi) != 1)
+		{
+			fprintf(stderr, "--dump-slot accepts exactly one input VMC file\n");
+			return 1;
+		}
+
+		vmc_path = argv[argi];
+		if (!vmc_get_info(vmc_path, &info) || info.embedded_slots == 0)
+		{
+			fprintf(stderr, "%s: --dump-slot requires a PS1HD container VMC\n", vmc_path);
+			return 1;
+		}
+
+		if (dump_slot >= info.embedded_slots)
+		{
+			fprintf(stderr, "%s: slot %u out of range (0..%u)\n", vmc_path, dump_slot, info.embedded_slots - 1);
+			return 1;
+		}
+
+		if (!vmc_dump_embedded_slot(vmc_path, dump_slot, dump_outfile))
+		{
+			fprintf(stderr, "%s: failed to dump slot %u to %s\n", vmc_path, dump_slot, dump_outfile);
+			return 1;
+		}
+
+		printf("Dumped slot %u to %s (%u bytes)\n", dump_slot, dump_outfile, PS1_RAW_SIZE);
+	}
+
 	for (i = argi; i < argc; i++)
-		failed |= print_vmc_info(argv[i], has_slot, slot, sealedkey_override);
+		failed |= print_vmc_info(argv[i], has_slot, slot, sealedkey_override, list_slots, fingerprint);
 
 	return failed ? 2 : 0;
 }

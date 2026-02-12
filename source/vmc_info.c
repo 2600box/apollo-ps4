@@ -6,7 +6,9 @@
 #include "vmc_info.h"
 
 #define PS1CARD_RAW_SIZE 131072
+#define PS1_RAW_SIZE PS1CARD_RAW_SIZE
 #define PS1HD_HDR_SIZE 0x8000
+#define PS1HD_HEADER_SIZE PS1HD_HDR_SIZE
 #define PS1HD_SLOT_SANITY_CAP 128
 #define PS2_MAGIC "Sony PS2 Memory Card Format "
 #define PS1_BLANK_CHECK_SIZE 4096
@@ -504,6 +506,102 @@ static int find_embedded_ps1_raw(FILE* fp, uint64_t file_size, uint64_t* out_off
 	}
 
 	return 0;
+}
+
+
+int vmc_read_embedded_slot(const char* path, uint32_t slot, uint8_t* buf, size_t buf_len)
+{
+	FILE* fp;
+	uint8_t hdr[0x2C] = {0};
+	uint64_t size;
+	uint64_t slots;
+	uint64_t slot_offset;
+
+	if (!path || !buf || buf_len < PS1_RAW_SIZE)
+		return 0;
+
+	fp = fopen(path, "rb");
+	if (!fp)
+		return 0;
+
+	if (fseeko(fp, 0, SEEK_END) < 0)
+	{
+		fclose(fp);
+		return 0;
+	}
+
+	size = (uint64_t) ftello(fp);
+	if (size <= PS1HD_HEADER_SIZE || fseeko(fp, 0, SEEK_SET) < 0)
+	{
+		fclose(fp);
+		return 0;
+	}
+
+	if (fread(hdr, 1, sizeof(hdr), fp) != sizeof(hdr))
+	{
+		fclose(fp);
+		return 0;
+	}
+
+	if (!(read_le32(hdr + 0x00) == 1 && read_le32(hdr + 0x20) == PS1HD_HEADER_SIZE && read_le32(hdr + 0x24) == 1 && read_le32(hdr + 0x28) == 1))
+	{
+		fclose(fp);
+		return 0;
+	}
+
+	if ((size - PS1HD_HEADER_SIZE) % PS1_RAW_SIZE != 0)
+	{
+		fclose(fp);
+		return 0;
+	}
+
+	slots = (size - PS1HD_HEADER_SIZE) / PS1_RAW_SIZE;
+	if (slot >= slots)
+	{
+		fclose(fp);
+		return 0;
+	}
+
+	slot_offset = PS1HD_HEADER_SIZE + ((uint64_t) slot * PS1_RAW_SIZE);
+	if (fseeko(fp, (off_t) slot_offset, SEEK_SET) < 0)
+	{
+		fclose(fp);
+		return 0;
+	}
+
+	if (fread(buf, 1, PS1_RAW_SIZE, fp) != PS1_RAW_SIZE)
+	{
+		fclose(fp);
+		return 0;
+	}
+
+	fclose(fp);
+	return 1;
+}
+
+int vmc_dump_embedded_slot(const char* path, uint32_t slot, const char* outfile)
+{
+	uint8_t slot_data[PS1_RAW_SIZE];
+	FILE* out;
+
+	if (!path || !outfile)
+		return 0;
+
+	if (!vmc_read_embedded_slot(path, slot, slot_data, sizeof(slot_data)))
+		return 0;
+
+	out = fopen(outfile, "wb");
+	if (!out)
+		return 0;
+
+	if (fwrite(slot_data, 1, sizeof(slot_data), out) != sizeof(slot_data))
+	{
+		fclose(out);
+		return 0;
+	}
+
+	fclose(out);
+	return 1;
 }
 
 const char* vmc_system_name(int system)

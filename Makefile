@@ -90,7 +90,7 @@ $(INTDIR)/%.o: $(PROJDIR)/%.cpp
 
 clean: ## Remove all generated files.
 	rm -f $(CONTENT_ID).pkg pkg.gp4 sce_sys/param.sfo eboot.bin \
-		$(INTDIR)/$(PROJDIR).elf $(INTDIR)/$(PROJDIR).oelf $(OBJS)
+		$(INTDIR)/$(PROJDIR).elf $(INTDIR)/$(PROJDIR).oelf $(OBJS) tools/vmcinfo
 
 #---------------------------------------------------------------------------------
 createzip: ## Download the latest appdata.zip cheat pack.
@@ -99,6 +99,10 @@ createzip: ## Download the latest appdata.zip cheat pack.
 	@rm -fr assets/misc/appdata.zip
 	@curl -L "https://bucanero.github.io/apollo-patches/PS4/apollo-ps4-update.zip" > assets/misc/appdata.zip
 
+
+vmcinfo: ## Build the Linux VMC info CLI utility (amd64).
+	gcc -O2 -Wall -Wextra -Iinclude -o tools/vmcinfo tools/vmc_info_cli.c source/vmc_info.c
+
 help: ## Display this help message.
 	@echo "Usage: make [target]"
 	@echo ""
@@ -106,5 +110,6 @@ help: ## Display this help message.
 	@echo "  all              - Build the package."
 	@echo "  clean            - Remove all generated files."
 	@echo "  createzip        - Download the latest appdata.zip cheat pack."
+	@echo "  vmcinfo          - Build the Linux VMC info CLI utility (amd64)."
 	@echo "  help             - Display this help message."
 	@echo ""

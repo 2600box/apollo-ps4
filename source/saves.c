@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#include <inttypes.h>
 #include <dirent.h>
 #include <orbis/SaveData.h>
 #include <sqlite3.h>
@@ -17,6 +18,7 @@
 #include "mcio.h"
 #include "ps1card.h"
 #include "sd.h"
+#include "vmc_info.h"
 
 #define UTF8_CHAR_STAR		"\xE2\x98\x85"
 
@@ -1607,7 +1609,7 @@ static void scan_vmc_files(const char* userPath, const save_entry_t* parent, lis
 	struct dirent *dir;
 	save_entry_t *item;
 	char psvPath[256];
-	uint64_t size;
+	vmc_info_t vmc;
 	uint16_t flag;
 
 	d = opendir(userPath);
@@ -1626,27 +1628,17 @@ static void scan_vmc_files(const char* userPath, const save_entry_t* parent, lis
 			continue;
 
 		snprintf(psvPath, sizeof(psvPath), "%s%s", userPath, dir->d_name);
-		get_file_size(psvPath, &size);
+		if (!vmc_get_info(psvPath, &vmc))
+			continue;
 
 		LOG("Checking %s...", psvPath);
-		switch (size)
+		switch (vmc.system)
 		{
-		case PS1CARD_SIZE:
-		case 0x20040:
-		case 0x20080:
-		case 0x200A0:
-		case 0x20F40:
+		case VMC_SYSTEM_PS1:
 			flag = SAVE_FLAG_PS1;
 			break;
 
-		case 0x800000:
-		case 0x840000:
-		case 0x1000000:
-		case 0x1080000:
-		case 0x2000000:
-		case 0x2100000:
-		case 0x4000000:
-		case 0x4200000:
+		case VMC_SYSTEM_PS2:
 			flag = SAVE_FLAG_PS2;
 			break;
 
@@ -2234,6 +2226,25 @@ int get_save_details(const save_entry_t* save, char **details)
 	if(save->type == FILE_TYPE_VMC)
 	{
 		char *tmp = strrchr(save->path, '/');
+		vmc_info_t vmc;
+
+		if (vmc_get_info(save->path, &vmc))
+		{
+			asprintf(details, "%s\n\n----- Virtual Memory Card -----\n"
+				"File: %s\n"
+				"Folder: %s\n"
+				"Type: %s\n"
+				"Size: %" PRIu64 " bytes\n"
+				"ECC data: %s\n",
+				save->path,
+				(tmp ? tmp+1 : save->path),
+				save->dir_name,
+				vmc_system_name(vmc.system),
+				vmc.file_size,
+				vmc.has_ecc ? "Yes" : "No");
+			return 1;
+		}
+
 		asprintf(details, "%s\n\n----- Virtual Memory Card -----\n"
 			"File: %s\n"
 			"Folder: %s\n",

@@ -33,7 +33,6 @@ static int g_verbose = 0;
 static uint64_t fnv1a64(const uint8_t* data, size_t len);
 static int buffer_looks_high_entropy(const uint8_t* data, size_t len);
 static int slot_has_signature(const uint8_t* slot_data);
-static int score_ps1_slot_layout(const uint8_t* slot_data);
 static void print_first16_hex_to(FILE* out, const uint8_t* data);
 static void print_first16_hex(const uint8_t* data);
 
@@ -332,47 +331,11 @@ static int decrypt_slot_xts(const uint8_t* in, uint8_t* out, size_t len, const u
 	return 1;
 }
 
-static void build_key_variant(uint8_t out[32], const uint8_t in[32], int key_mode)
-{
-	int i;
-
-	switch (key_mode)
-	{
-		case 1:
-			memcpy(out, in + 16, 16);
-			memcpy(out + 16, in, 16);
-			break;
-		case 2:
-			for (i = 0; i < 16; i++)
-			{
-				out[i] = in[15 - i];
-				out[16 + i] = in[31 - i];
-			}
-			break;
-		case 3:
-			for (i = 0; i < 32; i++)
-				out[i] = in[31 - i];
-			break;
-		default:
-			memcpy(out, in, 32);
-			break;
-		case 4:
-			for (i = 0; i < 32; i += 2)
-			{
-				out[i] = in[i + 1];
-				out[i + 1] = in[i];
-			}
-			break;
-	}
-}
-
 typedef struct decrypt_path {
-	int mode;
-	int key_mode;
+	const char* method;
 	size_t data_unit;
 	uint64_t sector_base;
 	int tweak_be;
-	int score;
 	char key_fp16[17];
 } decrypt_path_t;
 
@@ -396,92 +359,31 @@ static void key_fingerprint16_hex(const uint8_t* key, size_t len, char out[17])
 		snprintf(out + (i * 2), 3, "%02x", digest[i]);
 }
 
-static const char* key_mode_name(int key_mode)
-{
-	switch (key_mode)
-	{
-		case 1: return "swap-halves";
-		case 2: return "reverse-halves";
-		case 3: return "reverse-all";
-		case 4: return "swap-byte-pairs";
-		default: return "raw";
-	}
-}
-
 static int build_best_transformed_slot(const uint8_t* slot_data, uint32_t slot_index, const raw_key_blob_t* raw_key, uint8_t* best_candidate, decrypt_path_t* best_path)
 {
-	uint8_t candidate[PS1_RAW_SIZE];
-	uint8_t key_variant[32];
-	int best_score = -1;
-	int mode;
-	int key_mode_start;
-	int key_mode_end;
-	int key_mode;
-	size_t du_idx;
-	const size_t data_units[] = {512, 4096};
+	const size_t data_unit = 512;
+	const uint64_t sector_base = ((uint64_t) PS1HD_HEADER_SIZE + ((uint64_t) slot_index * (uint64_t) PS1_RAW_SIZE)) / data_unit;
+	const int tweak_be = 0;
 
 	if (!slot_data || !raw_key || !raw_key->valid || !best_candidate)
 		return 0;
 
-	if (raw_key->len == 32)
+	if (raw_key->len != 32)
+		return 0;
+
+	if (!decrypt_slot_xts(slot_data, best_candidate, PS1_RAW_SIZE, raw_key->data, raw_key->len, sector_base, tweak_be, data_unit))
+		return 0;
+
+	if (best_path)
 	{
-		key_mode_start = 0;
-		key_mode_end = 5;
-	}
-	else
-	{
-		key_mode_start = 0;
-		key_mode_end = 1;
-	}
-
-	for (key_mode = key_mode_start; key_mode < key_mode_end; key_mode++)
-	{
-		if (raw_key->len == 32)
-			build_key_variant(key_variant, raw_key->data, key_mode);
-
-		for (mode = 0; mode < 4; mode++)
-		{
-			for (du_idx = 0; du_idx < sizeof(data_units) / sizeof(data_units[0]); du_idx++)
-			{
-				size_t data_unit = data_units[du_idx];
-				uint64_t slot_byte_off = (uint64_t) slot_index * (uint64_t) PS1_RAW_SIZE;
-				uint64_t base_byte = (mode & 1) ? ((uint64_t) PS1HD_HEADER_SIZE + slot_byte_off) : slot_byte_off;
-				uint64_t sector_base = base_byte / data_unit;
-				int tweak_be = (mode & 2) ? 1 : 0;
-				int score = 0;
-				const uint8_t* key_data = (raw_key->len == 32) ? key_variant : raw_key->data;
-
-				if (!decrypt_slot_xts(slot_data, candidate, sizeof(candidate), key_data, raw_key->len, sector_base, tweak_be, data_unit))
-					continue;
-
-				score += score_ps1_slot_layout(candidate);
-				if (!buffer_looks_high_entropy(candidate, 4096))
-					score += 2;
-				if (candidate[0] == 'M' && candidate[1] == 'C')
-					score += 2;
-				if (dir_frames_look_plausible(candidate))
-					score += 2;
-
-				if (score > best_score)
-				{
-					memcpy(best_candidate, candidate, PS1_RAW_SIZE);
-					best_score = score;
-					if (best_path)
-					{
-						best_path->mode = mode;
-						best_path->key_mode = key_mode;
-						best_path->data_unit = data_unit;
-						best_path->sector_base = sector_base;
-						best_path->tweak_be = tweak_be;
-						best_path->score = score;
-						key_fingerprint16_hex(key_data, raw_key->len, best_path->key_fp16);
-					}
-				}
-			}
-		}
+		best_path->method = "ps1hd-fixed";
+		best_path->data_unit = data_unit;
+		best_path->sector_base = sector_base;
+		best_path->tweak_be = tweak_be;
+		key_fingerprint16_hex(raw_key->data, raw_key->len, best_path->key_fp16);
 	}
 
-	return best_score >= 0;
+	return 1;
 }
 
 static int maybe_transform_slot_with_raw_key(uint8_t* slot_data, uint32_t slot_index, const raw_key_blob_t* raw_key)
@@ -495,13 +397,8 @@ static int maybe_transform_slot_with_raw_key(uint8_t* slot_data, uint32_t slot_i
 	if (!build_best_transformed_slot(slot_data, slot_index, raw_key, best_candidate, &path))
 		return 0;
 
-	if (path.score >= 12)
-	{
-		memcpy(slot_data, best_candidate, sizeof(best_candidate));
-		return 1;
-	}
-
-	return 0;
+	memcpy(slot_data, best_candidate, sizeof(best_candidate));
+	return 1;
 }
 
 static double estimate_shannon_entropy(const uint8_t* data, size_t len)
@@ -703,46 +600,6 @@ static int slot_has_signature(const uint8_t* slot_data)
 		return 1;
 
 	return 0;
-}
-
-static int score_ps1_slot_layout(const uint8_t* slot_data)
-{
-	int i;
-	int score = 0;
-	int used_entries = 0;
-	int plausible_entries = 0;
-
-	if (!slot_data)
-		return 0;
-
-	if (slot_has_signature(slot_data))
-		score += 8;
-
-	for (i = 0; i < PS1_SLOT_COUNT; i++)
-	{
-		const uint8_t* dir = slot_data + PS1_DIR_OFFSET + (i * PS1_DIR_ENTRY_SIZE);
-		uint8_t type = dir[0];
-		uint32_t size_bytes;
-
-		if (type == 0xA0 || type == 0xA1 || type == 0xA2 || type == 0x50 || type == 0x51 || type == 0x52 || type == 0x53)
-			score += 1;
-
-		if (!(type == 0x51 || type == 0xA1))
-			continue;
-
-		used_entries++;
-		size_bytes = (uint32_t) dir[4] | ((uint32_t) dir[5] << 8) | ((uint32_t) dir[6] << 16);
-		if (size_bytes >= PS1_BLOCK_SIZE && size_bytes <= (PS1_SLOT_COUNT * PS1_BLOCK_SIZE) && (size_bytes % PS1_BLOCK_SIZE) == 0)
-		{
-			plausible_entries++;
-			score += 3;
-		}
-	}
-
-	if (used_entries > 0 && plausible_entries == used_entries)
-		score += 4;
-
-	return score;
 }
 
 static void copy_ps1_text(char* out, size_t out_len, const uint8_t* src, size_t src_len)
@@ -1092,14 +949,13 @@ static int dump_slot_with_validation(const char* vmc_path, uint32_t target_slot,
 
 	if (g_verbose && cand_built)
 	{
-		printf("Decrypt path (%s): key_mode=%s key_fp=%s data_unit=%zu sector_base=%" PRIu64 " tweak_endian=%s score=%d\n",
+		printf("Decrypt path (%s): method=%s key_fp=%s data_unit=%zu sector_base=%" PRIu64 " tweak_endian=%s\n",
 			op_label,
-			key_mode_name(best_path.key_mode),
+			best_path.method ? best_path.method : "unknown",
 			best_path.key_fp16[0] ? best_path.key_fp16 : "n/a",
 			best_path.data_unit,
 			best_path.sector_base,
-			best_path.tweak_be ? "be64" : "le64",
-			best_path.score);
+			best_path.tweak_be ? "be64" : "le64");
 	}
 
 	validation = validate_mcd_buffer(cand_slot, sizeof(cand_slot), op_label, g_verbose);

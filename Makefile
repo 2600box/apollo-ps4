@@ -136,7 +136,7 @@ VMCINFO_LDLIBS ?=
 
 
 vmcinfo: ## Build the Linux VMC info CLI utility (amd64).
-	$(VMCINFO_CC) $(VMCINFO_CFLAGS) $(VMCINFO_CPPFLAGS) $(OPENSSL_CFLAGS) -Iinclude -o tools/vmcinfo tools/vmc_info_cli.c source/vmc_info.c $(VMCINFO_LDFLAGS) $(OPENSSL_LIBS) $(VMCINFO_LDLIBS) -lm
+	$(VMCINFO_CC) $(VMCINFO_CFLAGS) $(VMCINFO_CPPFLAGS) $(OPENSSL_CFLAGS) -Iinclude -o tools/vmcinfo tools/vmc_info_cli.c source/vmc_info.c $(VMCINFO_LDFLAGS) $(OPENSSL_LIBS) $(VMCINFO_LDLIBS) -lm -lz
 
 .PHONY: vmcinfo
 

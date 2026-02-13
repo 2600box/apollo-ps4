@@ -6,6 +6,8 @@
 #include <ctype.h>
 #include <math.h>
 
+#include <zlib.h>
+
 #include <openssl/evp.h>
 
 #include "vmc_info.h"
@@ -17,15 +19,20 @@
 #define PS1_SLOT_COUNT 15
 #define PS1_DIR_ENTRY_SIZE 128
 #define PS1_DIR_OFFSET 0x80
+#define ANALYSE_WINDOW_4K 4096
+#define ANALYSE_WINDOW_8K 8192
+#define SWEEP_MAX_DATA_UNITS 8
+#define SWEEP_MAX_ENDIAN_VARIANTS 2
+#define SWEEP_TOP_CANDIDATES 10
 
 static void print_usage(const char* argv0)
 {
-	fprintf(stderr, "Usage: %s [--slot N] [--list-slots] [--fingerprint] [--verbose] [--dump-slot N OUTFILE] [--decrypt OUTFILE] [--sealedkey PATH] [--rawkey PATH|--rawkey-hex HEX] <memory-card.vmc> [more...]\n", argv0);
+	fprintf(stderr, "Usage: %s [--slot N] [--list-slots] [--fingerprint] [--verbose] [--dump-slot N OUTFILE] [--decrypt OUTFILE] [--sweep] [--analyse FILE] [--sealedkey PATH] [--rawkey PATH|--rawkey-hex HEX] <memory-card.vmc> [more...]\n", argv0);
 	fprintf(stderr, "  --slot N            Target embedded slot N for slot-dependent operations (including --decrypt).\n");
-	fprintf(stderr, "  --dump-slot N FILE  Dump embedded slot N; writes FILE only when valid .mcd, else FILE.raw/FILE.cand.\n");
-	fprintf(stderr, "  --decrypt FILE      Decrypt targeted slot (--slot, default 0) to FILE when valid .mcd, else FILE.raw/FILE.cand.\n");
-	fprintf(stderr, "  --rawkey-hex HEX    Raw key bytes as hex (16/32/48 bytes). Accepts spaces/newlines/0x prefixes.\n");
-	fprintf(stderr, "  --verbose           Print decrypt-path diagnostics and validation failure reasons.\n");
+	fprintf(stderr, "  --dump-slot N FILE  Dump embedded slot N raw payload bytes exactly as stored (128 KiB).\n");
+	fprintf(stderr, "  --decrypt FILE      Decrypt targeted slot (--slot, default 0) to FILE and print validation status.\n");
+	fprintf(stderr, "  --rawkey-hex HEX    Raw key bytes as hex (16/32/48 bytes). Accepts spaces/newlines/0x prefixes.\n  --data-unit N       Override XTS data unit size (default: 512).\n  --sector-base N     Override XTS sector base.\n  --tweak-endian E    Override tweak endianness: le64 or be64.\n  --payload-offset N  Override slot payload base offset inside container.\n  --sweep             Sweep decrypt parameters for first 8 KiB and rank candidates.\n  --decrypt-best FILE With --sweep, decrypt full slot using best aligned-MC candidate.\n  --sweep-data-units A,B  Sweep data units (default: 512,4096).\n  --sweep-sector-delta N  Sweep +/- around sector base (default: 1024).\n  --sweep-step N      Sector base sweep step (default: 64).\n  --sweep-endians L   Sweep endians list (default: le64,be64).\n  --analyse FILE      Analyze arbitrary file content (entropy/zeros/zlib/MC hits).\n");
+	fprintf(stderr, "  --verbose           Print decrypt-path diagnostics and analysis metrics.\n");
 }
 
 static int g_verbose = 0;
@@ -41,13 +48,25 @@ typedef enum mcd_verdict {
 	MCD_VALID = 1,
 } mcd_verdict_t;
 
+typedef struct buffer_analysis {
+	double entropy_4k;
+	size_t zero_count_4k;
+	double zlib_ratio_4k;
+	size_t mc_offsets[32];
+	int mc_aligned[32];
+	size_t mc_count;
+} buffer_analysis_t;
+
 typedef struct mcd_validation {
 	mcd_verdict_t verdict;
 	double entropy_4k;
+	size_t zero_count_4k;
+	double zlib_ratio_4k;
 	int begins_with_mc;
 	int plausible_dir_flags;
 	int not_all_zero;
 	int not_all_ff;
+	buffer_analysis_t analysis;
 	const char* fail_reason;
 } mcd_validation_t;
 
@@ -336,8 +355,33 @@ typedef struct decrypt_path {
 	size_t data_unit;
 	uint64_t sector_base;
 	int tweak_be;
+	uint64_t payload_offset;
+	int data_unit_overridden;
+	int sector_base_overridden;
+	int tweak_endian_overridden;
+	int payload_offset_overridden;
 	char key_fp16[17];
 } decrypt_path_t;
+
+typedef struct decrypt_overrides {
+	size_t data_unit;
+	uint64_t sector_base;
+	int tweak_be;
+	uint64_t payload_offset;
+	int has_data_unit;
+	int has_sector_base;
+	int has_tweak_be;
+	int has_payload_offset;
+} decrypt_overrides_t;
+
+
+typedef struct sweep_candidate {
+	decrypt_path_t path;
+	buffer_analysis_t analysis;
+	double rank_score;
+	int has_mc_zero;
+	int has_mc_aligned;
+} sweep_candidate_t;
 
 static void key_fingerprint16_hex(const uint8_t* key, size_t len, char out[17])
 {
@@ -359,11 +403,13 @@ static void key_fingerprint16_hex(const uint8_t* key, size_t len, char out[17])
 		snprintf(out + (i * 2), 3, "%02x", digest[i]);
 }
 
-static int build_best_transformed_slot(const uint8_t* slot_data, uint32_t slot_index, const raw_key_blob_t* raw_key, uint8_t* best_candidate, decrypt_path_t* best_path)
+static int build_best_transformed_slot(const uint8_t* slot_data, uint32_t slot_index, const raw_key_blob_t* raw_key, uint8_t* best_candidate, const decrypt_overrides_t* overrides, decrypt_path_t* best_path)
 {
-	const size_t data_unit = 512;
-	const uint64_t sector_base = ((uint64_t) PS1HD_HEADER_SIZE + ((uint64_t) slot_index * (uint64_t) PS1_RAW_SIZE)) / data_unit;
-	const int tweak_be = 0;
+	const uint64_t default_payload_offset = (uint64_t) PS1HD_HEADER_SIZE + ((uint64_t) slot_index * (uint64_t) PS1_RAW_SIZE);
+	size_t data_unit = 512;
+	uint64_t payload_offset = default_payload_offset;
+	uint64_t sector_base;
+	int tweak_be = 0;
 
 	if (!slot_data || !raw_key || !raw_key->valid || !best_candidate)
 		return 0;
@@ -371,15 +417,38 @@ static int build_best_transformed_slot(const uint8_t* slot_data, uint32_t slot_i
 	if (raw_key->len != 32)
 		return 0;
 
+	if (overrides)
+	{
+		if (overrides->has_data_unit)
+			data_unit = overrides->data_unit;
+		if (overrides->has_payload_offset)
+			payload_offset = overrides->payload_offset + ((uint64_t) slot_index * (uint64_t) PS1_RAW_SIZE);
+		if (overrides->has_tweak_be)
+			tweak_be = overrides->tweak_be;
+	}
+
+	if (data_unit == 0 || (PS1_RAW_SIZE % data_unit) != 0)
+		return 0;
+
+	sector_base = payload_offset / data_unit;
+	if (overrides && overrides->has_sector_base)
+		sector_base = overrides->sector_base;
+
 	if (!decrypt_slot_xts(slot_data, best_candidate, PS1_RAW_SIZE, raw_key->data, raw_key->len, sector_base, tweak_be, data_unit))
 		return 0;
 
 	if (best_path)
 	{
+		memset(best_path, 0, sizeof(*best_path));
 		best_path->method = "ps1hd-fixed";
 		best_path->data_unit = data_unit;
 		best_path->sector_base = sector_base;
 		best_path->tweak_be = tweak_be;
+		best_path->payload_offset = payload_offset;
+		best_path->data_unit_overridden = overrides ? overrides->has_data_unit : 0;
+		best_path->sector_base_overridden = overrides ? overrides->has_sector_base : 0;
+		best_path->tweak_endian_overridden = overrides ? overrides->has_tweak_be : 0;
+		best_path->payload_offset_overridden = overrides ? overrides->has_payload_offset : 0;
 		key_fingerprint16_hex(raw_key->data, raw_key->len, best_path->key_fp16);
 	}
 
@@ -394,7 +463,7 @@ static int maybe_transform_slot_with_raw_key(uint8_t* slot_data, uint32_t slot_i
 	if (!slot_data || !raw_key || !raw_key->valid)
 		return 0;
 
-	if (!build_best_transformed_slot(slot_data, slot_index, raw_key, best_candidate, &path))
+	if (!build_best_transformed_slot(slot_data, slot_index, raw_key, best_candidate, NULL, &path))
 		return 0;
 
 	memcpy(slot_data, best_candidate, sizeof(best_candidate));
@@ -424,6 +493,89 @@ static double estimate_shannon_entropy(const uint8_t* data, size_t len)
 
 	return entropy;
 }
+static double zlib_ratio_estimate(const uint8_t* data, size_t len)
+{
+	uLongf bound;
+	uLongf out_len;
+	Bytef* comp;
+	double ratio;
+
+	if (!data || len == 0)
+		return 1.0;
+
+	bound = compressBound((uLong) len);
+	comp = (Bytef*) malloc((size_t) bound);
+	if (!comp)
+		return 1.0;
+
+	out_len = bound;
+	if (compress2(comp, &out_len, data, (uLong) len, Z_BEST_SPEED) != Z_OK)
+	{
+		free(comp);
+		return 1.0;
+	}
+
+	ratio = (double) out_len / (double) len;
+	free(comp);
+	return ratio;
+}
+
+static void analyze_buffer(const uint8_t* data, size_t len, buffer_analysis_t* out)
+{
+	size_t i;
+	size_t win4k;
+	size_t win8k;
+
+	if (!out)
+		return;
+	memset(out, 0, sizeof(*out));
+
+	if (!data || len == 0)
+		return;
+
+	win4k = len < ANALYSE_WINDOW_4K ? len : ANALYSE_WINDOW_4K;
+	win8k = len < ANALYSE_WINDOW_8K ? len : ANALYSE_WINDOW_8K;
+	out->entropy_4k = estimate_shannon_entropy(data, win4k);
+	out->zlib_ratio_4k = zlib_ratio_estimate(data, win4k);
+
+	for (i = 0; i < win4k; i++)
+	{
+		if (data[i] == 0x00)
+			out->zero_count_4k++;
+	}
+
+	for (i = 0; i + 1 < win8k; i++)
+	{
+		if (data[i] == 'M' && data[i + 1] == 'C' && out->mc_count < (sizeof(out->mc_offsets) / sizeof(out->mc_offsets[0])))
+		{
+			out->mc_offsets[out->mc_count] = i;
+			out->mc_aligned[out->mc_count] = ((i % 0x200) == 0);
+			out->mc_count++;
+		}
+	}
+}
+
+static void print_analysis(const buffer_analysis_t* analysis)
+{
+	size_t i;
+
+	if (!analysis)
+		return;
+
+	printf("  entropy(first4k): %.3f bits/byte\n", analysis->entropy_4k);
+	printf("  zeros(first4k): %zu\n", analysis->zero_count_4k);
+	printf("  zlib_ratio(first4k): %.3f\n", analysis->zlib_ratio_4k);
+	if (analysis->mc_count == 0)
+		printf("  MC hits(first8k): none\n");
+	else
+	{
+		printf("  MC hits(first8k):");
+		for (i = 0; i < analysis->mc_count; i++)
+			printf(" 0x%zx%s", analysis->mc_offsets[i], analysis->mc_aligned[i] ? "(aligned)" : "");
+		printf("\n");
+	}
+}
+
 
 static int dir_frames_look_plausible(const uint8_t* slot_data)
 {
@@ -474,7 +626,10 @@ static mcd_validation_t validate_mcd_buffer(const uint8_t* data, size_t len, con
 	out.not_all_zero = !all_zero;
 	out.not_all_ff = !all_ff;
 	out.begins_with_mc = (data[0] == 'M' && data[1] == 'C');
-	out.entropy_4k = estimate_shannon_entropy(data, 4096);
+	analyze_buffer(data, len, &out.analysis);
+	out.entropy_4k = out.analysis.entropy_4k;
+	out.zero_count_4k = out.analysis.zero_count_4k;
+	out.zlib_ratio_4k = out.analysis.zlib_ratio_4k;
 	out.plausible_dir_flags = dir_frames_look_plausible(data);
 
 	if (!out.not_all_zero)
@@ -873,136 +1028,197 @@ static int print_vmc_info(const char* path, int has_slot, uint32_t slot, const c
 	return 0;
 }
 
-static int dump_slot_with_validation(const char* vmc_path, uint32_t target_slot, const char* out_prefix, const char* rawkey_path, const raw_key_blob_t* raw_key, const char* op_label)
+static int read_slot_payload(const char* vmc_path, const vmc_info_t* info, uint32_t target_slot, const decrypt_overrides_t* overrides, uint8_t out[PS1_RAW_SIZE], uint64_t* payload_offset_used)
+{
+	uint64_t payload_offset;
+	FILE* in;
+
+	if (!vmc_path || !info || !out)
+		return 0;
+
+	if (info->embedded_slots > 0)
+	{
+		if (target_slot >= info->embedded_slots)
+			return 0;
+		payload_offset = ((overrides && overrides->has_payload_offset) ? overrides->payload_offset : (uint64_t) PS1HD_HEADER_SIZE) + ((uint64_t) target_slot * (uint64_t) PS1_RAW_SIZE);
+		in = fopen(vmc_path, "rb");
+		if (!in)
+			return 0;
+		if (fseeko(in, (off_t) payload_offset, SEEK_SET) < 0 || fread(out, 1, PS1_RAW_SIZE, in) != PS1_RAW_SIZE)
+		{
+			fclose(in);
+			return 0;
+		}
+		fclose(in);
+	}
+	else if (info->system == VMC_SYSTEM_PS1 && info->raw_size == PS1_RAW_SIZE)
+	{
+		if (target_slot != 0)
+			return 0;
+		payload_offset = 0;
+		in = fopen(vmc_path, "rb");
+		if (!in)
+			return 0;
+		if (fread(out, 1, PS1_RAW_SIZE, in) != PS1_RAW_SIZE)
+		{
+			fclose(in);
+			return 0;
+		}
+		fclose(in);
+	}
+	else
+		return 0;
+
+	if (payload_offset_used)
+		*payload_offset_used = payload_offset;
+	return 1;
+}
+
+static int analyse_file_path(const char* path)
+{
+	uint8_t buf[ANALYSE_WINDOW_8K];
+	FILE* fp = fopen(path, "rb");
+	size_t got;
+	buffer_analysis_t analysis;
+	if (!fp)
+		return 0;
+	got = fread(buf, 1, sizeof(buf), fp);
+	fclose(fp);
+	analyze_buffer(buf, got, &analysis);
+	printf("Analysis: %s (%zu bytes sampled)\n", path, got);
+	print_analysis(&analysis);
+	return 1;
+}
+
+static int dump_slot_with_validation(const char* vmc_path, uint32_t target_slot, const char* out_prefix, const char* rawkey_path, const raw_key_blob_t* raw_key, const char* op_label, const decrypt_overrides_t* overrides)
 {
 	vmc_info_t info;
 	uint8_t raw_slot[PS1_RAW_SIZE];
 	uint8_t cand_slot[PS1_RAW_SIZE];
 	mcd_validation_t validation;
 	decrypt_path_t best_path;
-	char raw_out[1024];
-	char cand_out[1024];
 	int cand_built;
+	uint64_t payload_offset = 0;
 
 	if (!vmc_path || !out_prefix || !raw_key || !raw_key->valid)
 		return 0;
-
 	if (!vmc_get_info(vmc_path, &info))
-	{
-		fprintf(stderr, "%s: failed to parse VMC file\n", vmc_path);
 		return 0;
-	}
-
-	if (info.system != VMC_SYSTEM_PS1)
-	{
-		fprintf(stderr, "%s: %s supports PS1 VMC files only\n", vmc_path, op_label);
+	if (!read_slot_payload(vmc_path, &info, target_slot, overrides, raw_slot, &payload_offset))
 		return 0;
-	}
 
-	if (info.embedded_slots > 0)
-	{
-		if (target_slot >= info.embedded_slots)
-		{
-			fprintf(stderr, "%s: slot %u out of range (0..%u)\n", vmc_path, target_slot, info.embedded_slots - 1);
-			return 0;
-		}
-
-		if (!vmc_read_embedded_slot(vmc_path, target_slot, raw_slot, sizeof(raw_slot)))
-		{
-			fprintf(stderr, "%s: failed to read slot %u\n", vmc_path, target_slot);
-			return 0;
-		}
-	}
-	else if (info.system == VMC_SYSTEM_PS1 && info.raw_size == PS1_RAW_SIZE)
-	{
-		FILE* in = fopen(vmc_path, "rb");
-		if (!in)
-		{
-			fprintf(stderr, "%s: failed to open input\n", vmc_path);
-			return 0;
-		}
-
-		if (fread(raw_slot, 1, sizeof(raw_slot), in) != sizeof(raw_slot))
-		{
-			fclose(in);
-			fprintf(stderr, "%s: failed to read raw PS1 VMC\n", vmc_path);
-			return 0;
-		}
-		fclose(in);
-
-		if (target_slot != 0)
-		{
-			fprintf(stderr, "%s: %s requested slot %u but raw PS1 VMC has only slot 0\n", vmc_path, op_label, target_slot);
-			return 0;
-		}
-	}
-	else
-	{
-		fprintf(stderr, "%s: %s supports PS1 raw cards and PS1HD container VMCs\n", vmc_path, op_label);
-		return 0;
-	}
-
-	memset(&best_path, 0, sizeof(best_path));
-	cand_built = build_best_transformed_slot(raw_slot, target_slot, raw_key, cand_slot, &best_path);
+	cand_built = build_best_transformed_slot(raw_slot, target_slot, raw_key, cand_slot, overrides, &best_path);
 	if (!cand_built)
-		memset(cand_slot, 0, sizeof(cand_slot));
+		return 0;
 
-	if (g_verbose && cand_built)
+	if (g_verbose)
 	{
-		printf("Decrypt path (%s): method=%s key_fp=%s data_unit=%zu sector_base=%" PRIu64 " tweak_endian=%s\n",
+		printf("Decrypt path (%s): method=%s key_fp=%s data_unit=%zu%s sector_base=%" PRIu64 "%s tweak_endian=%s%s payload_offset=%" PRIu64 "%s\n",
 			op_label,
 			best_path.method ? best_path.method : "unknown",
 			best_path.key_fp16[0] ? best_path.key_fp16 : "n/a",
 			best_path.data_unit,
+			best_path.data_unit_overridden ? " (override)" : " (default)",
 			best_path.sector_base,
-			best_path.tweak_be ? "be64" : "le64");
+			best_path.sector_base_overridden ? " (override)" : " (computed)",
+			best_path.tweak_be ? "be64" : "le64",
+			best_path.tweak_endian_overridden ? " (override)" : " (default)",
+			best_path.payload_offset,
+			best_path.payload_offset_overridden ? " (override)" : " (computed)");
 	}
 
 	validation = validate_mcd_buffer(cand_slot, sizeof(cand_slot), op_label, g_verbose);
-	if (cand_built && validation.verdict == MCD_VALID)
+	if (!write_buffer_file(out_prefix, cand_slot, sizeof(cand_slot)))
+		return 0;
+	printf("%s slot %u -> %s (%u bytes)%s\n", op_label, target_slot, out_prefix, PS1_RAW_SIZE, validation.verdict == MCD_VALID ? ", valid .mcd" : ", validation failed");
+	(void) rawkey_path;
+	(void) payload_offset;
+	return 1;
+}
+
+
+static double sweep_rank_score(const buffer_analysis_t* a)
+{
+	double score = 0.0;
+	if (!a)
+		return 1e9;
+	score += a->entropy_4k;
+	score += a->zlib_ratio_4k * 8.0;
+	score -= (double) a->zero_count_4k / 1024.0;
+	return score;
+}
+
+static int run_sweep(const char* vmc_path, uint32_t slot, const raw_key_blob_t* raw_key, const decrypt_overrides_t* overrides, const size_t* data_units, size_t data_unit_count, uint64_t sector_delta, uint64_t sweep_step, const int* endian_values, size_t endian_count, const char* decrypt_best)
+{
+	vmc_info_t info;
+	uint8_t raw_slot[PS1_RAW_SIZE];
+	uint8_t probe[ANALYSE_WINDOW_8K];
+	sweep_candidate_t best[SWEEP_TOP_CANDIDATES];
+	uint64_t payload_offset = 0;
+	size_t i, j;
+	int found = 0;
+	int best_idx = -1;
+
+	if (!vmc_get_info(vmc_path, &info) || !read_slot_payload(vmc_path, &info, slot, overrides, raw_slot, &payload_offset))
+		return 0;
+	for (i = 0; i < SWEEP_TOP_CANDIDATES; i++)
+		best[i].rank_score = 1e9;
+
+	for (i = 0; i < data_unit_count; i++)
 	{
-		if (!write_buffer_file(out_prefix, cand_slot, sizeof(cand_slot)))
+		size_t du = data_units[i];
+		uint64_t base = ((overrides && overrides->has_sector_base) ? overrides->sector_base : (payload_offset / du));
+		uint64_t start = (base > sector_delta) ? (base - sector_delta) : 0;
+		uint64_t end = base + sector_delta;
+		for (j = 0; j < endian_count; j++)
 		{
-			fprintf(stderr, "%s: failed to write %s\n", vmc_path, out_prefix);
-			return 0;
+			uint64_t s;
+			for (s = start; s <= end; s += sweep_step)
+			{
+				buffer_analysis_t analysis;
+				sweep_candidate_t cand;
+				memset(&cand, 0, sizeof(cand));
+				if (ANALYSE_WINDOW_8K % du != 0)
+					continue;
+				if (!decrypt_slot_xts(raw_slot, probe, ANALYSE_WINDOW_8K, raw_key->data, raw_key->len, s, endian_values[j], du))
+					continue;
+				analyze_buffer(probe, sizeof(probe), &analysis);
+				cand.analysis = analysis;
+				cand.rank_score = sweep_rank_score(&analysis);
+				cand.has_mc_zero = (analysis.mc_count > 0 && analysis.mc_offsets[0] == 0);
+				cand.has_mc_aligned = 0;
+				for (size_t k=0;k<analysis.mc_count;k++) if (analysis.mc_aligned[k]) cand.has_mc_aligned = 1;
+				cand.path.data_unit = du;
+				cand.path.sector_base = s;
+				cand.path.tweak_be = endian_values[j];
+				cand.path.payload_offset = payload_offset;
+				if (cand.rank_score < best[SWEEP_TOP_CANDIDATES-1].rank_score)
+				{
+					best[SWEEP_TOP_CANDIDATES-1] = cand;
+					for (int m=SWEEP_TOP_CANDIDATES-1;m>0;m--) if (best[m].rank_score < best[m-1].rank_score) { sweep_candidate_t t=best[m-1]; best[m-1]=best[m]; best[m]=t; }
+				}
+				found = 1;
+			}
 		}
-
-		printf("%s slot %u -> %s (%u bytes, valid .mcd)\n", op_label, target_slot, out_prefix, PS1_RAW_SIZE);
-		return 1;
 	}
 
-	snprintf(raw_out, sizeof(raw_out), "%s.raw", out_prefix);
-	snprintf(cand_out, sizeof(cand_out), "%s.cand", out_prefix);
-
-	if (!write_buffer_file(raw_out, raw_slot, sizeof(raw_slot)))
-	{
-		fprintf(stderr, "%s: failed to write %s\n", vmc_path, raw_out);
+	if (!found)
 		return 0;
-	}
-
-	if (cand_built && !write_buffer_file(cand_out, cand_slot, sizeof(cand_slot)))
+	printf("Sweep top candidates:\n");
+	for (i = 0; i < SWEEP_TOP_CANDIDATES && best[i].rank_score < 1e9; i++)
 	{
-		fprintf(stderr, "%s: failed to write %s\n", vmc_path, cand_out);
-		return 0;
+		printf("  #%zu data_unit=%zu sector_base=%" PRIu64 " tweak_endian=%s entropy=%.3f zratio=%.3f zeros=%zu mc_hits=%zu\n",
+			i + 1, best[i].path.data_unit, best[i].path.sector_base, best[i].path.tweak_be ? "be64" : "le64", best[i].analysis.entropy_4k, best[i].analysis.zlib_ratio_4k, best[i].analysis.zero_count_4k, best[i].analysis.mc_count);
+		if (best_idx < 0 && (best[i].has_mc_zero || best[i].has_mc_aligned))
+			best_idx = (int) i;
 	}
-
-	fprintf(stderr,
-		"%s slot %u invalid mcd header; key=%s (%zu bytes), candidate_MC=%s, reason=%s, raw16=",
-		op_label,
-		target_slot,
-		rawkey_path ? rawkey_path : "<none>",
-		raw_key->len,
-		(cand_built && cand_slot[0] == 'M' && cand_slot[1] == 'C') ? "yes" : "no",
-		validation.fail_reason ? validation.fail_reason : "unknown");
-	print_first16_hex_to(stderr, raw_slot);
-	fprintf(stderr, " cand16=");
-	if (cand_built)
-		print_first16_hex_to(stderr, cand_slot);
-	else
-		fprintf(stderr, "<none>");
-	fprintf(stderr, " wrote=%s%s%s\n", raw_out, cand_built ? "," : "", cand_built ? cand_out : "");
-
-	return 0;
+	if (decrypt_best && best_idx >= 0)
+	{
+		uint8_t full[PS1_RAW_SIZE];
+		if (decrypt_slot_xts(raw_slot, full, PS1_RAW_SIZE, raw_key->data, raw_key->len, best[best_idx].path.sector_base, best[best_idx].path.tweak_be, best[best_idx].path.data_unit) && write_buffer_file(decrypt_best, full, sizeof(full)))
+			printf("decrypt-best -> %s (%u bytes)\n", decrypt_best, PS1_RAW_SIZE);
+	}
+	return 1;
 }
 
 int main(int argc, char** argv)
@@ -1015,15 +1231,26 @@ int main(int argc, char** argv)
 	int fingerprint = 0;
 	int has_dump_slot = 0;
 	int has_decrypt_out = 0;
+	int run_sweep_mode = 0;
 	uint32_t slot = 0;
 	uint32_t dump_slot = 0;
+	uint64_t sweep_sector_delta = 1024;
+	uint64_t sweep_step = 64;
 	const char* dump_outfile = NULL;
 	const char* decrypt_outfile = NULL;
+	const char* decrypt_best_out = NULL;
+	const char* analyse_path = NULL;
 	const char* sealedkey_override = NULL;
 	const char* rawkey_override = NULL;
 	const char* rawkey_hex_override = NULL;
 	const char* input_paths[argc > 0 ? (size_t) argc : 1];
+	size_t sweep_data_units[SWEEP_MAX_DATA_UNITS] = {512, 4096};
+	int sweep_endians[SWEEP_MAX_ENDIAN_VARIANTS] = {0, 1};
+	size_t sweep_data_unit_count = 2;
+	size_t sweep_endian_count = 2;
+	decrypt_overrides_t overrides;
 	int input_count = 0;
+	memset(&overrides, 0, sizeof(overrides));
 
 	if (argc < 2)
 	{
@@ -1038,219 +1265,64 @@ int main(int argc, char** argv)
 			print_usage(argv[0]);
 			return 0;
 		}
-
-		if (strcmp(argv[argi], "--slot") == 0)
+		if (strcmp(argv[argi], "--slot") == 0 && argi + 1 < argc) { slot = (uint32_t) strtoul(argv[++argi], NULL, 10); has_slot = 1; argi++; continue; }
+		if (strcmp(argv[argi], "--dump-slot") == 0 && argi + 2 < argc) { dump_slot = (uint32_t) strtoul(argv[argi + 1], NULL, 10); dump_outfile = argv[argi + 2]; has_dump_slot = 1; argi += 3; continue; }
+		if (strcmp(argv[argi], "--decrypt") == 0 && argi + 1 < argc) { decrypt_outfile = argv[argi + 1]; has_decrypt_out = 1; argi += 2; continue; }
+		if (strcmp(argv[argi], "--decrypt-best") == 0 && argi + 1 < argc) { decrypt_best_out = argv[argi + 1]; argi += 2; continue; }
+		if (strcmp(argv[argi], "--analyse") == 0 && argi + 1 < argc) { analyse_path = argv[argi + 1]; argi += 2; continue; }
+		if (strcmp(argv[argi], "--list-slots") == 0) { list_slots = 1; argi++; continue; }
+		if (strcmp(argv[argi], "--fingerprint") == 0) { fingerprint = 1; argi++; continue; }
+		if (strcmp(argv[argi], "--verbose") == 0 || strcmp(argv[argi], "--debug-decrypt") == 0) { g_verbose = 1; argi++; continue; }
+		if (strcmp(argv[argi], "--sealedkey") == 0 && argi + 1 < argc) { sealedkey_override = argv[argi + 1]; argi += 2; continue; }
+		if (strcmp(argv[argi], "--rawkey") == 0 && argi + 1 < argc) { rawkey_override = argv[argi + 1]; argi += 2; continue; }
+		if (strcmp(argv[argi], "--rawkey-hex") == 0 && argi + 1 < argc) { rawkey_hex_override = argv[argi + 1]; argi += 2; continue; }
+		if (strcmp(argv[argi], "--data-unit") == 0 && argi + 1 < argc) { overrides.data_unit = (size_t) strtoull(argv[argi + 1], NULL, 10); overrides.has_data_unit = 1; argi += 2; continue; }
+		if (strcmp(argv[argi], "--sector-base") == 0 && argi + 1 < argc) { overrides.sector_base = strtoull(argv[argi + 1], NULL, 10); overrides.has_sector_base = 1; argi += 2; continue; }
+		if (strcmp(argv[argi], "--payload-offset") == 0 && argi + 1 < argc) { overrides.payload_offset = strtoull(argv[argi + 1], NULL, 10); overrides.has_payload_offset = 1; argi += 2; continue; }
+		if (strcmp(argv[argi], "--tweak-endian") == 0 && argi + 1 < argc) { overrides.tweak_be = (strcmp(argv[argi + 1], "be64") == 0); overrides.has_tweak_be = 1; argi += 2; continue; }
+		if (strcmp(argv[argi], "--sweep") == 0) { run_sweep_mode = 1; argi++; continue; }
+		if (strcmp(argv[argi], "--sweep-sector-delta") == 0 && argi + 1 < argc) { sweep_sector_delta = strtoull(argv[argi + 1], NULL, 10); argi += 2; continue; }
+		if (strcmp(argv[argi], "--sweep-step") == 0 && argi + 1 < argc) { sweep_step = strtoull(argv[argi + 1], NULL, 10); argi += 2; continue; }
+		if (strcmp(argv[argi], "--sweep-data-units") == 0 && argi + 1 < argc)
 		{
-			char* end;
-			unsigned long parsed;
-
-			if (argi + 1 >= argc)
-			{
-				print_usage(argv[0]);
-				return 1;
-			}
-
-			parsed = strtoul(argv[argi + 1], &end, 10);
-			if (*argv[argi + 1] == '\0' || *end != '\0' || parsed > UINT32_MAX)
-			{
-				fprintf(stderr, "Invalid slot value: %s\n", argv[argi + 1]);
-				return 1;
-			}
-
-			slot = (uint32_t) parsed;
-			has_slot = 1;
-			argi += 2;
-			continue;
+			char tmp[128];
+			char* tok;
+			strncpy(tmp, argv[argi + 1], sizeof(tmp)-1); tmp[sizeof(tmp)-1]='\0';
+			sweep_data_unit_count = 0;
+			for (tok = strtok(tmp, ","); tok && sweep_data_unit_count < SWEEP_MAX_DATA_UNITS; tok = strtok(NULL, ","))
+				sweep_data_units[sweep_data_unit_count++] = (size_t) strtoull(tok, NULL, 10);
+			argi += 2; continue;
 		}
-
-		if (strcmp(argv[argi], "--dump-slot") == 0)
+		if (strcmp(argv[argi], "--sweep-endians") == 0 && argi + 1 < argc)
 		{
-			char* end;
-			unsigned long parsed;
-
-			if (argi + 2 >= argc)
-			{
-				print_usage(argv[0]);
-				return 1;
-			}
-
-			parsed = strtoul(argv[argi + 1], &end, 10);
-			if (*argv[argi + 1] == '\0' || *end != '\0' || parsed > UINT32_MAX)
-			{
-				fprintf(stderr, "Invalid dump slot value: %s\n", argv[argi + 1]);
-				return 1;
-			}
-
-			dump_slot = (uint32_t) parsed;
-			dump_outfile = argv[argi + 2];
-			has_dump_slot = 1;
-			argi += 3;
-			continue;
+			sweep_endian_count = 0;
+			if (strstr(argv[argi + 1], "le64")) sweep_endians[sweep_endian_count++] = 0;
+			if (strstr(argv[argi + 1], "be64") && sweep_endian_count < SWEEP_MAX_ENDIAN_VARIANTS) sweep_endians[sweep_endian_count++] = 1;
+			argi += 2; continue;
 		}
-
-		if (strcmp(argv[argi], "--decrypt") == 0)
-		{
-			if (argi + 1 >= argc)
-			{
-				print_usage(argv[0]);
-				return 1;
-			}
-
-			decrypt_outfile = argv[argi + 1];
-			has_decrypt_out = 1;
-			argi += 2;
-			continue;
-		}
-
-		if (strcmp(argv[argi], "--list-slots") == 0)
-		{
-			list_slots = 1;
-			argi += 1;
-			continue;
-		}
-
-		if (strcmp(argv[argi], "--fingerprint") == 0)
-		{
-			fingerprint = 1;
-			argi += 1;
-			continue;
-		}
-
-		if (strcmp(argv[argi], "--verbose") == 0 || strcmp(argv[argi], "--debug-decrypt") == 0)
-		{
-			g_verbose = 1;
-			argi += 1;
-			continue;
-		}
-
-		if (strcmp(argv[argi], "--sealedkey") == 0)
-		{
-			if (argi + 1 >= argc)
-			{
-				print_usage(argv[0]);
-				return 1;
-			}
-
-			sealedkey_override = argv[argi + 1];
-			argi += 2;
-			continue;
-		}
-
-		if (strcmp(argv[argi], "--rawkey") == 0)
-		{
-			if (argi + 1 >= argc)
-			{
-				print_usage(argv[0]);
-				return 1;
-			}
-
-			rawkey_override = argv[argi + 1];
-			argi += 2;
-			continue;
-		}
-
-		if (strcmp(argv[argi], "--rawkey-hex") == 0)
-		{
-			if (argi + 1 >= argc)
-			{
-				print_usage(argv[0]);
-				return 1;
-			}
-
-			rawkey_hex_override = argv[argi + 1];
-			argi += 2;
-			continue;
-		}
-
-		if (strncmp(argv[argi], "--", 2) == 0)
-		{
-			print_usage(argv[0]);
-			return 1;
-		}
-
-		input_paths[input_count++] = argv[argi];
-		argi += 1;
+		if (strncmp(argv[argi], "--", 2) == 0) { print_usage(argv[0]); return 1; }
+		input_paths[input_count++] = argv[argi++];
 	}
 
-	if (input_count == 0)
-	{
-		print_usage(argv[0]);
-		return 1;
-	}
+	if (analyse_path && !analyse_file_path(analyse_path)) return 1;
+	if (input_count == 0) return analyse_path ? 0 : 1;
 
 	if (has_dump_slot)
 	{
 		vmc_info_t info;
-		const char* vmc_path;
-		raw_key_blob_t raw_key;
-		int raw_key_loaded;
-
-		if (input_count != 1)
-		{
-			fprintf(stderr, "--dump-slot accepts exactly one input VMC file\n");
-			return 1;
-		}
-
-		vmc_path = input_paths[0];
-		if (!vmc_get_info(vmc_path, &info) || info.embedded_slots == 0)
-		{
-			fprintf(stderr, "%s: --dump-slot requires a PS1HD container VMC\n", vmc_path);
-			return 1;
-		}
-
-		if (dump_slot >= info.embedded_slots)
-		{
-			fprintf(stderr, "%s: slot %u out of range (0..%u)\n", vmc_path, dump_slot, info.embedded_slots - 1);
-			return 1;
-		}
-
-		raw_key_loaded = load_raw_key(rawkey_override, &raw_key);
-		if (!raw_key_loaded)
-			raw_key_loaded = load_raw_key_hex(rawkey_hex_override, &raw_key);
-
-		if (!raw_key_loaded)
-		{
-			if (rawkey_override || rawkey_hex_override)
-				fprintf(stderr, "Warning: unable to load raw key (%s%s%s); dumping raw slot bytes\n", rawkey_override ? rawkey_override : "", (rawkey_override && rawkey_hex_override) ? " / " : "", rawkey_hex_override ? "inline hex" : "");
-
-			if (!vmc_dump_embedded_slot(vmc_path, dump_slot, dump_outfile))
-			{
-				fprintf(stderr, "%s: failed to dump slot %u to %s\n", vmc_path, dump_slot, dump_outfile);
-				return 1;
-			}
-
-			printf("dump-slot slot %u -> %s (%u bytes, raw bytes; no valid raw-key transform available)\n", dump_slot, dump_outfile, PS1_RAW_SIZE);
-		}
-		else if (!dump_slot_with_validation(vmc_path, dump_slot, dump_outfile, rawkey_override, &raw_key, "dump-slot"))
-		{
-			return 1;
-		}
+		uint8_t raw_slot[PS1_RAW_SIZE];
+		if (input_count != 1) return 1;
+		if (!vmc_get_info(input_paths[0], &info) || info.embedded_slots == 0) { fprintf(stderr, "%s: --dump-slot requires a PS1HD container VMC\n", input_paths[0]); return 1; }
+		if (!read_slot_payload(input_paths[0], &info, dump_slot, &overrides, raw_slot, NULL) || !write_buffer_file(dump_outfile, raw_slot, sizeof(raw_slot))) return 1;
+		printf("dump-slot slot %u -> %s (%u bytes, raw payload)\n", dump_slot, dump_outfile, PS1_RAW_SIZE);
 	}
 
-	if (has_decrypt_out)
+	if (has_decrypt_out || run_sweep_mode)
 	{
 		raw_key_blob_t raw_key;
-
-		if (input_count != 1)
-		{
-			fprintf(stderr, "--decrypt accepts exactly one input VMC file\n");
-			return 1;
-		}
-
-		if (!rawkey_override && !rawkey_hex_override)
-		{
-			fprintf(stderr, "--decrypt requires --rawkey PATH or --rawkey-hex HEX\n");
-			return 1;
-		}
-
-		if (!load_raw_key(rawkey_override, &raw_key) && !load_raw_key_hex(rawkey_hex_override, &raw_key))
-		{
-			fprintf(stderr, "Failed to load raw key\n");
-			return 1;
-		}
-
-		if (!dump_slot_with_validation(input_paths[0], has_slot ? slot : 0, decrypt_outfile, rawkey_override ? rawkey_override : "inline hex", &raw_key, "decrypt"))
-			return 1;
+		if (!load_raw_key(rawkey_override, &raw_key) && !load_raw_key_hex(rawkey_hex_override, &raw_key)) return 1;
+		if (has_decrypt_out && !dump_slot_with_validation(input_paths[0], has_slot ? slot : 0, decrypt_outfile, rawkey_override ? rawkey_override : "inline hex", &raw_key, "decrypt", &overrides)) return 1;
+		if (run_sweep_mode && !run_sweep(input_paths[0], has_slot ? slot : 0, &raw_key, &overrides, sweep_data_units, sweep_data_unit_count, sweep_sector_delta, sweep_step, sweep_endians, sweep_endian_count, decrypt_best_out)) return 1;
 	}
 
 	for (i = 0; i < input_count; i++)

@@ -20,10 +20,11 @@
 
 static void print_usage(const char* argv0)
 {
-	fprintf(stderr, "Usage: %s [--slot N] [--list-slots] [--fingerprint] [--dump-slot N OUTFILE] [--decrypt OUTFILE] [--sealedkey PATH] [--rawkey PATH] <memory-card.vmc> [more...]\n", argv0);
+	fprintf(stderr, "Usage: %s [--slot N] [--list-slots] [--fingerprint] [--dump-slot N OUTFILE] [--decrypt OUTFILE] [--sealedkey PATH] [--rawkey PATH|--rawkey-hex HEX] <memory-card.vmc> [more...]\n", argv0);
 	fprintf(stderr, "  --slot N            Target embedded slot N for slot-dependent operations (including --decrypt).\n");
 	fprintf(stderr, "  --dump-slot N FILE  Dump embedded slot N; writes FILE only when valid .mcd, else FILE.raw/FILE.cand.\n");
 	fprintf(stderr, "  --decrypt FILE      Decrypt targeted slot (--slot, default 0) to FILE when valid .mcd, else FILE.raw/FILE.cand.\n");
+	fprintf(stderr, "  --rawkey-hex HEX    Raw key bytes as hex (16/32/48 bytes). Accepts spaces/newlines/0x prefixes.\n");
 }
 
 static uint64_t fnv1a64(const uint8_t* data, size_t len);
@@ -187,6 +188,83 @@ static int load_raw_key(const char* rawkey_path, raw_key_blob_t* out)
 	return 1;
 }
 
+static int parse_hex_nibble(char c, uint8_t* out)
+{
+	if (!out)
+		return 0;
+
+	if (c >= '0' && c <= '9')
+	{
+		*out = (uint8_t) (c - '0');
+		return 1;
+	}
+
+	if (c >= 'a' && c <= 'f')
+	{
+		*out = (uint8_t) (10 + (c - 'a'));
+		return 1;
+	}
+
+	if (c >= 'A' && c <= 'F')
+	{
+		*out = (uint8_t) (10 + (c - 'A'));
+		return 1;
+	}
+
+	return 0;
+}
+
+static int load_raw_key_hex(const char* rawkey_hex, raw_key_blob_t* out)
+{
+	uint8_t hi = 0;
+	int have_hi = 0;
+	size_t i;
+
+	if (!out)
+		return 0;
+
+	memset(out, 0, sizeof(*out));
+	if (!rawkey_hex)
+		return 0;
+
+	for (i = 0; rawkey_hex[i] != '\0'; i++)
+	{
+		uint8_t nibble;
+		char ch = rawkey_hex[i];
+
+		if (isspace((unsigned char) ch))
+			continue;
+
+		if (ch == '0' && (rawkey_hex[i + 1] == 'x' || rawkey_hex[i + 1] == 'X'))
+		{
+			i++;
+			continue;
+		}
+
+		if (!parse_hex_nibble(ch, &nibble))
+			return 0;
+
+		if (!have_hi)
+		{
+			hi = nibble;
+			have_hi = 1;
+			continue;
+		}
+
+		if (out->len >= sizeof(out->data))
+			return 0;
+
+		out->data[out->len++] = (uint8_t) ((hi << 4) | nibble);
+		have_hi = 0;
+	}
+
+	if (have_hi || !raw_key_size_allowed(out->len))
+		return 0;
+
+	out->valid = 1;
+	return 1;
+}
+
 static int decrypt_slot_xts(const uint8_t* in, uint8_t* out, size_t len, const uint8_t* key, size_t key_len, uint64_t sector_base, int tweak_be)
 {
 	EVP_CIPHER_CTX* ctx;
@@ -270,6 +348,13 @@ static void build_key_variant(uint8_t out[32], const uint8_t in[32], int key_mod
 		default:
 			memcpy(out, in, 32);
 			break;
+		case 4:
+			for (i = 0; i < 32; i += 2)
+			{
+				out[i] = in[i + 1];
+				out[i + 1] = in[i];
+			}
+			break;
 	}
 }
 
@@ -290,7 +375,7 @@ static int maybe_transform_slot_with_raw_key(uint8_t* slot_data, uint32_t slot_i
 	if (raw_key->len == 32)
 	{
 		key_mode_start = 0;
-		key_mode_end = 4;
+		key_mode_end = 5;
 	}
 	else
 	{
@@ -352,7 +437,7 @@ static int build_best_transformed_slot(const uint8_t* slot_data, uint32_t slot_i
 	if (raw_key->len == 32)
 	{
 		key_mode_start = 0;
-		key_mode_end = 4;
+		key_mode_end = 5;
 	}
 	else
 	{
@@ -771,7 +856,7 @@ static int print_slot_summary(const char* path, uint32_t slots, int encrypted, i
 	return 0;
 }
 
-static int print_vmc_info(const char* path, int has_slot, uint32_t slot, const char* sealedkey_override, const char* rawkey_override, int explicit_list_slots, int fingerprint)
+static int print_vmc_info(const char* path, int has_slot, uint32_t slot, const char* sealedkey_override, const char* rawkey_override, const char* rawkey_hex_override, int explicit_list_slots, int fingerprint)
 {
 	vmc_info_t info;
 	pfs_sealedkey_info_t sk_info;
@@ -781,6 +866,8 @@ static int print_vmc_info(const char* path, int has_slot, uint32_t slot, const c
 	int raw_key_loaded = 0;
 
 	raw_key_loaded = load_raw_key(rawkey_override, &raw_key);
+	if (!raw_key_loaded)
+		raw_key_loaded = load_raw_key_hex(rawkey_hex_override, &raw_key);
 
 	if ((has_slot && !vmc_get_info_slot(path, &info, slot)) || (!has_slot && !vmc_get_info(path, &info)))
 	{
@@ -856,6 +943,8 @@ static int print_vmc_info(const char* path, int has_slot, uint32_t slot, const c
 
 		if (rawkey_override)
 			print_raw_key_info(rawkey_override);
+		else if (rawkey_hex_override)
+			printf("Raw key: present (%zu bytes) [inline hex]\n", raw_key.len);
 	}
 
 	puts("");
@@ -996,6 +1085,7 @@ int main(int argc, char** argv)
 	const char* decrypt_outfile = NULL;
 	const char* sealedkey_override = NULL;
 	const char* rawkey_override = NULL;
+	const char* rawkey_hex_override = NULL;
 	const char* input_paths[argc > 0 ? (size_t) argc : 1];
 	int input_count = 0;
 
@@ -1116,6 +1206,19 @@ int main(int argc, char** argv)
 			continue;
 		}
 
+		if (strcmp(argv[argi], "--rawkey-hex") == 0)
+		{
+			if (argi + 1 >= argc)
+			{
+				print_usage(argv[0]);
+				return 1;
+			}
+
+			rawkey_hex_override = argv[argi + 1];
+			argi += 2;
+			continue;
+		}
+
 		if (strncmp(argv[argi], "--", 2) == 0)
 		{
 			print_usage(argv[0]);
@@ -1159,11 +1262,13 @@ int main(int argc, char** argv)
 		}
 
 		raw_key_loaded = load_raw_key(rawkey_override, &raw_key);
+		if (!raw_key_loaded)
+			raw_key_loaded = load_raw_key_hex(rawkey_hex_override, &raw_key);
 
 		if (!raw_key_loaded)
 		{
-			if (rawkey_override)
-				fprintf(stderr, "Warning: unable to load raw key from %s; dumping raw slot bytes\n", rawkey_override);
+			if (rawkey_override || rawkey_hex_override)
+				fprintf(stderr, "Warning: unable to load raw key (%s%s%s); dumping raw slot bytes\n", rawkey_override ? rawkey_override : "", (rawkey_override && rawkey_hex_override) ? " / " : "", rawkey_hex_override ? "inline hex" : "");
 
 			if (!vmc_dump_embedded_slot(vmc_path, dump_slot, dump_outfile))
 			{
@@ -1189,24 +1294,24 @@ int main(int argc, char** argv)
 			return 1;
 		}
 
-		if (!rawkey_override)
+		if (!rawkey_override && !rawkey_hex_override)
 		{
-			fprintf(stderr, "--decrypt requires --rawkey PATH\n");
+			fprintf(stderr, "--decrypt requires --rawkey PATH or --rawkey-hex HEX\n");
 			return 1;
 		}
 
-		if (!load_raw_key(rawkey_override, &raw_key))
+		if (!load_raw_key(rawkey_override, &raw_key) && !load_raw_key_hex(rawkey_hex_override, &raw_key))
 		{
-			fprintf(stderr, "Failed to load raw key from %s\n", rawkey_override);
+			fprintf(stderr, "Failed to load raw key\n");
 			return 1;
 		}
 
-		if (!dump_slot_with_validation(input_paths[0], has_slot ? slot : 0, decrypt_outfile, rawkey_override, &raw_key, "decrypt"))
+		if (!dump_slot_with_validation(input_paths[0], has_slot ? slot : 0, decrypt_outfile, rawkey_override ? rawkey_override : "inline hex", &raw_key, "decrypt"))
 			return 1;
 	}
 
 	for (i = 0; i < input_count; i++)
-		failed |= print_vmc_info(input_paths[i], has_slot, slot, sealedkey_override, rawkey_override, list_slots, fingerprint);
+		failed |= print_vmc_info(input_paths[i], has_slot, slot, sealedkey_override, rawkey_override, rawkey_hex_override, list_slots, fingerprint);
 
 	return failed ? 2 : 0;
 }

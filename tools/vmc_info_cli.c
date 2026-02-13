@@ -20,12 +20,15 @@
 
 static void print_usage(const char* argv0)
 {
-	fprintf(stderr, "Usage: %s [--slot N] [--list-slots] [--fingerprint] [--dump-slot N OUTFILE] [--decrypt OUTFILE] [--sealedkey PATH] [--rawkey PATH|--rawkey-hex HEX] <memory-card.vmc> [more...]\n", argv0);
+	fprintf(stderr, "Usage: %s [--slot N] [--list-slots] [--fingerprint] [--verbose] [--dump-slot N OUTFILE] [--decrypt OUTFILE] [--sealedkey PATH] [--rawkey PATH|--rawkey-hex HEX] <memory-card.vmc> [more...]\n", argv0);
 	fprintf(stderr, "  --slot N            Target embedded slot N for slot-dependent operations (including --decrypt).\n");
 	fprintf(stderr, "  --dump-slot N FILE  Dump embedded slot N; writes FILE only when valid .mcd, else FILE.raw/FILE.cand.\n");
 	fprintf(stderr, "  --decrypt FILE      Decrypt targeted slot (--slot, default 0) to FILE when valid .mcd, else FILE.raw/FILE.cand.\n");
 	fprintf(stderr, "  --rawkey-hex HEX    Raw key bytes as hex (16/32/48 bytes). Accepts spaces/newlines/0x prefixes.\n");
+	fprintf(stderr, "  --verbose           Print decrypt-path diagnostics and validation failure reasons.\n");
 }
+
+static int g_verbose = 0;
 
 static uint64_t fnv1a64(const uint8_t* data, size_t len);
 static int buffer_looks_high_entropy(const uint8_t* data, size_t len);
@@ -44,9 +47,14 @@ typedef struct mcd_validation {
 	double entropy_4k;
 	int begins_with_mc;
 	int plausible_dir_flags;
+	int not_all_zero;
+	int not_all_ff;
+	const char* fail_reason;
 } mcd_validation_t;
 
 static const size_t g_raw_key_sizes[] = {16, 32, 48};
+
+static int dir_frames_look_plausible(const uint8_t* slot_data);
 
 typedef struct raw_key_blob {
 	uint8_t data[64];
@@ -265,7 +273,7 @@ static int load_raw_key_hex(const char* rawkey_hex, raw_key_blob_t* out)
 	return 1;
 }
 
-static int decrypt_slot_xts(const uint8_t* in, uint8_t* out, size_t len, const uint8_t* key, size_t key_len, uint64_t sector_base, int tweak_be)
+static int decrypt_slot_xts(const uint8_t* in, uint8_t* out, size_t len, const uint8_t* key, size_t key_len, uint64_t sector_base, int tweak_be, size_t data_unit)
 {
 	EVP_CIPHER_CTX* ctx;
 	const EVP_CIPHER* cipher = NULL;
@@ -273,7 +281,7 @@ static int decrypt_slot_xts(const uint8_t* in, uint8_t* out, size_t len, const u
 	int out_len;
 	size_t off;
 
-	if (!in || !out || !key || len % 512 != 0)
+	if (!in || !out || !key || data_unit == 0 || len % data_unit != 0)
 		return 0;
 
 	if (key_len == 32)
@@ -289,9 +297,9 @@ static int decrypt_slot_xts(const uint8_t* in, uint8_t* out, size_t len, const u
 	if (!ctx)
 		return 0;
 
-	for (off = 0; off < len; off += 512)
+	for (off = 0; off < len; off += data_unit)
 	{
-		uint64_t sector = sector_base + (off / 512);
+		uint64_t sector = sector_base + (off / data_unit);
 		size_t i;
 
 		memset(iv, 0, sizeof(iv));
@@ -313,7 +321,7 @@ static int decrypt_slot_xts(const uint8_t* in, uint8_t* out, size_t len, const u
 			return 0;
 		}
 
-		if (EVP_DecryptUpdate(ctx, out + off, &out_len, in + off, 512) != 1 || out_len != 512)
+		if (EVP_DecryptUpdate(ctx, out + off, &out_len, in + off, (int) data_unit) != 1 || out_len != (int) data_unit)
 		{
 			EVP_CIPHER_CTX_free(ctx);
 			return 0;
@@ -358,70 +366,49 @@ static void build_key_variant(uint8_t out[32], const uint8_t in[32], int key_mod
 	}
 }
 
-static int maybe_transform_slot_with_raw_key(uint8_t* slot_data, uint32_t slot_index, const raw_key_blob_t* raw_key)
-{
-	uint8_t candidate[PS1_RAW_SIZE];
-	uint8_t best_candidate[PS1_RAW_SIZE];
-	uint8_t key_variant[32];
-	int best_score = -1;
+typedef struct decrypt_path {
 	int mode;
-	int key_mode_start;
-	int key_mode_end;
 	int key_mode;
+	size_t data_unit;
+	uint64_t sector_base;
+	int tweak_be;
+	int score;
+	char key_fp16[17];
+} decrypt_path_t;
 
-	if (!slot_data || !raw_key || !raw_key->valid)
-		return 0;
+static void key_fingerprint16_hex(const uint8_t* key, size_t len, char out[17])
+{
+	unsigned char digest[EVP_MAX_MD_SIZE];
+	unsigned int dlen = 0;
+	int i;
 
-	if (raw_key->len == 32)
-	{
-		key_mode_start = 0;
-		key_mode_end = 5;
-	}
-	else
-	{
-		key_mode_start = 0;
-		key_mode_end = 1;
-	}
+	if (!out)
+		return;
 
-	for (key_mode = key_mode_start; key_mode < key_mode_end; key_mode++)
-	{
-		if (raw_key->len == 32)
-			build_key_variant(key_variant, raw_key->data, key_mode);
+	out[0] = '\0';
+	if (!key || len == 0)
+		return;
 
-		for (mode = 0; mode < 4; mode++)
-		{
-			uint64_t sector_base = (mode & 1) ? (((uint64_t) PS1HD_HEADER_SIZE / 512) + ((uint64_t) slot_index * (PS1_RAW_SIZE / 512))) : ((uint64_t) slot_index * (PS1_RAW_SIZE / 512));
-			int tweak_be = (mode & 2) ? 1 : 0;
-			int score = 0;
-			const uint8_t* key_data = (raw_key->len == 32) ? key_variant : raw_key->data;
+	if (EVP_Digest(key, len, digest, &dlen, EVP_sha256(), NULL) != 1 || dlen < 8)
+		return;
 
-			if (!decrypt_slot_xts(slot_data, candidate, sizeof(candidate), key_data, raw_key->len, sector_base, tweak_be))
-				continue;
-
-			score += score_ps1_slot_layout(candidate);
-			if (!buffer_looks_high_entropy(candidate, 4096))
-				score += 2;
-			if (candidate[0] == 'M' && candidate[1] == 'C')
-				score += 2;
-
-			if (score > best_score)
-			{
-				memcpy(best_candidate, candidate, sizeof(best_candidate));
-				best_score = score;
-			}
-		}
-	}
-
-	if (best_score >= 12)
-	{
-		memcpy(slot_data, best_candidate, sizeof(best_candidate));
-		return 1;
-	}
-
-	return 0;
+	for (i = 0; i < 8; i++)
+		snprintf(out + (i * 2), 3, "%02x", digest[i]);
 }
 
-static int build_best_transformed_slot(const uint8_t* slot_data, uint32_t slot_index, const raw_key_blob_t* raw_key, uint8_t* best_candidate)
+static const char* key_mode_name(int key_mode)
+{
+	switch (key_mode)
+	{
+		case 1: return "swap-halves";
+		case 2: return "reverse-halves";
+		case 3: return "reverse-all";
+		case 4: return "swap-byte-pairs";
+		default: return "raw";
+	}
+}
+
+static int build_best_transformed_slot(const uint8_t* slot_data, uint32_t slot_index, const raw_key_blob_t* raw_key, uint8_t* best_candidate, decrypt_path_t* best_path)
 {
 	uint8_t candidate[PS1_RAW_SIZE];
 	uint8_t key_variant[32];
@@ -430,6 +417,8 @@ static int build_best_transformed_slot(const uint8_t* slot_data, uint32_t slot_i
 	int key_mode_start;
 	int key_mode_end;
 	int key_mode;
+	size_t du_idx;
+	const size_t data_units[] = {512, 4096};
 
 	if (!slot_data || !raw_key || !raw_key->valid || !best_candidate)
 		return 0;
@@ -452,29 +441,67 @@ static int build_best_transformed_slot(const uint8_t* slot_data, uint32_t slot_i
 
 		for (mode = 0; mode < 4; mode++)
 		{
-			uint64_t sector_base = (mode & 1) ? (((uint64_t) PS1HD_HEADER_SIZE / 512) + ((uint64_t) slot_index * (PS1_RAW_SIZE / 512))) : ((uint64_t) slot_index * (PS1_RAW_SIZE / 512));
-			int tweak_be = (mode & 2) ? 1 : 0;
-			int score = 0;
-			const uint8_t* key_data = (raw_key->len == 32) ? key_variant : raw_key->data;
-
-			if (!decrypt_slot_xts(slot_data, candidate, sizeof(candidate), key_data, raw_key->len, sector_base, tweak_be))
-				continue;
-
-			score += score_ps1_slot_layout(candidate);
-			if (!buffer_looks_high_entropy(candidate, 4096))
-				score += 2;
-			if (candidate[0] == 'M' && candidate[1] == 'C')
-				score += 2;
-
-			if (score > best_score)
+			for (du_idx = 0; du_idx < sizeof(data_units) / sizeof(data_units[0]); du_idx++)
 			{
-				memcpy(best_candidate, candidate, PS1_RAW_SIZE);
-				best_score = score;
+				size_t data_unit = data_units[du_idx];
+				uint64_t slot_byte_off = (uint64_t) slot_index * (uint64_t) PS1_RAW_SIZE;
+				uint64_t base_byte = (mode & 1) ? ((uint64_t) PS1HD_HEADER_SIZE + slot_byte_off) : slot_byte_off;
+				uint64_t sector_base = base_byte / data_unit;
+				int tweak_be = (mode & 2) ? 1 : 0;
+				int score = 0;
+				const uint8_t* key_data = (raw_key->len == 32) ? key_variant : raw_key->data;
+
+				if (!decrypt_slot_xts(slot_data, candidate, sizeof(candidate), key_data, raw_key->len, sector_base, tweak_be, data_unit))
+					continue;
+
+				score += score_ps1_slot_layout(candidate);
+				if (!buffer_looks_high_entropy(candidate, 4096))
+					score += 2;
+				if (candidate[0] == 'M' && candidate[1] == 'C')
+					score += 2;
+				if (dir_frames_look_plausible(candidate))
+					score += 2;
+
+				if (score > best_score)
+				{
+					memcpy(best_candidate, candidate, PS1_RAW_SIZE);
+					best_score = score;
+					if (best_path)
+					{
+						best_path->mode = mode;
+						best_path->key_mode = key_mode;
+						best_path->data_unit = data_unit;
+						best_path->sector_base = sector_base;
+						best_path->tweak_be = tweak_be;
+						best_path->score = score;
+						key_fingerprint16_hex(key_data, raw_key->len, best_path->key_fp16);
+					}
+				}
 			}
 		}
 	}
 
 	return best_score >= 0;
+}
+
+static int maybe_transform_slot_with_raw_key(uint8_t* slot_data, uint32_t slot_index, const raw_key_blob_t* raw_key)
+{
+	uint8_t best_candidate[PS1_RAW_SIZE];
+	decrypt_path_t path;
+
+	if (!slot_data || !raw_key || !raw_key->valid)
+		return 0;
+
+	if (!build_best_transformed_slot(slot_data, slot_index, raw_key, best_candidate, &path))
+		return 0;
+
+	if (path.score >= 12)
+	{
+		memcpy(slot_data, best_candidate, sizeof(best_candidate));
+		return 1;
+	}
+
+	return 0;
 }
 
 static double estimate_shannon_entropy(const uint8_t* data, size_t len)
@@ -525,15 +552,49 @@ static int dir_frames_look_plausible(const uint8_t* slot_data)
 static mcd_validation_t validate_mcd_buffer(const uint8_t* data, size_t len, const char* label, int verbose)
 {
 	mcd_validation_t out;
+	size_t i;
+	int all_zero = 1;
+	int all_ff = 1;
 
 	memset(&out, 0, sizeof(out));
+	out.fail_reason = "unknown";
 	if (!data || len != PS1_RAW_SIZE)
+	{
+		out.fail_reason = "invalid size";
 		return out;
+	}
 
+	for (i = 0; i < len; i++)
+	{
+		if (data[i] != 0x00)
+			all_zero = 0;
+		if (data[i] != 0xFF)
+			all_ff = 0;
+		if (!all_zero && !all_ff)
+			break;
+	}
+
+	out.not_all_zero = !all_zero;
+	out.not_all_ff = !all_ff;
 	out.begins_with_mc = (data[0] == 'M' && data[1] == 'C');
 	out.entropy_4k = estimate_shannon_entropy(data, 4096);
 	out.plausible_dir_flags = dir_frames_look_plausible(data);
-	out.verdict = out.begins_with_mc ? MCD_VALID : MCD_NOT_MCD;
+
+	if (!out.not_all_zero)
+		out.fail_reason = "all bytes are 0x00";
+	else if (!out.not_all_ff)
+		out.fail_reason = "all bytes are 0xFF";
+	else if (!out.begins_with_mc)
+		out.fail_reason = "missing MC header";
+	else if (!out.plausible_dir_flags)
+		out.fail_reason = "directory flags implausible";
+	else if (out.entropy_4k > 7.6)
+		out.fail_reason = "first 4KiB looks encrypted/high-entropy";
+	else
+	{
+		out.verdict = MCD_VALID;
+		out.fail_reason = NULL;
+	}
 
 	if (verbose)
 	{
@@ -544,7 +605,11 @@ static mcd_validation_t validate_mcd_buffer(const uint8_t* data, size_t len, con
 		printf("  begins_with_MC: %s\n", out.begins_with_mc ? "yes" : "no");
 		printf("  entropy(first4k): %.3f bits/byte (%s)\n", out.entropy_4k, out.entropy_4k > 7.6 ? "high" : "normal");
 		printf("  plausible_directory_flags: %s\n", out.plausible_dir_flags ? "yes" : "no");
+		printf("  not_all_zero: %s\n", out.not_all_zero ? "yes" : "no");
+		printf("  not_all_ff: %s\n", out.not_all_ff ? "yes" : "no");
 		printf("  verdict: %s\n", out.verdict == MCD_VALID ? "VALID_MCD" : "NOT_MCD");
+		if (out.fail_reason)
+			printf("  fail_reason: %s\n", out.fail_reason);
 	}
 
 	return out;
@@ -957,6 +1022,7 @@ static int dump_slot_with_validation(const char* vmc_path, uint32_t target_slot,
 	uint8_t raw_slot[PS1_RAW_SIZE];
 	uint8_t cand_slot[PS1_RAW_SIZE];
 	mcd_validation_t validation;
+	decrypt_path_t best_path;
 	char raw_out[1024];
 	char cand_out[1024];
 	int cand_built;
@@ -1019,11 +1085,24 @@ static int dump_slot_with_validation(const char* vmc_path, uint32_t target_slot,
 		return 0;
 	}
 
-	cand_built = build_best_transformed_slot(raw_slot, target_slot, raw_key, cand_slot);
+	memset(&best_path, 0, sizeof(best_path));
+	cand_built = build_best_transformed_slot(raw_slot, target_slot, raw_key, cand_slot, &best_path);
 	if (!cand_built)
 		memset(cand_slot, 0, sizeof(cand_slot));
 
-	validation = validate_mcd_buffer(cand_slot, sizeof(cand_slot), op_label, 0);
+	if (g_verbose && cand_built)
+	{
+		printf("Decrypt path (%s): key_mode=%s key_fp=%s data_unit=%zu sector_base=%" PRIu64 " tweak_endian=%s score=%d\n",
+			op_label,
+			key_mode_name(best_path.key_mode),
+			best_path.key_fp16[0] ? best_path.key_fp16 : "n/a",
+			best_path.data_unit,
+			best_path.sector_base,
+			best_path.tweak_be ? "be64" : "le64",
+			best_path.score);
+	}
+
+	validation = validate_mcd_buffer(cand_slot, sizeof(cand_slot), op_label, g_verbose);
 	if (cand_built && validation.verdict == MCD_VALID)
 	{
 		if (!write_buffer_file(out_prefix, cand_slot, sizeof(cand_slot)))
@@ -1052,12 +1131,13 @@ static int dump_slot_with_validation(const char* vmc_path, uint32_t target_slot,
 	}
 
 	fprintf(stderr,
-		"%s slot %u invalid mcd header; key=%s (%zu bytes), candidate_MC=%s, raw16=",
+		"%s slot %u invalid mcd header; key=%s (%zu bytes), candidate_MC=%s, reason=%s, raw16=",
 		op_label,
 		target_slot,
 		rawkey_path ? rawkey_path : "<none>",
 		raw_key->len,
-		(cand_built && cand_slot[0] == 'M' && cand_slot[1] == 'C') ? "yes" : "no");
+		(cand_built && cand_slot[0] == 'M' && cand_slot[1] == 'C') ? "yes" : "no",
+		validation.fail_reason ? validation.fail_reason : "unknown");
 	print_first16_hex_to(stderr, raw_slot);
 	fprintf(stderr, " cand16=");
 	if (cand_built)
@@ -1176,6 +1256,13 @@ int main(int argc, char** argv)
 		if (strcmp(argv[argi], "--fingerprint") == 0)
 		{
 			fingerprint = 1;
+			argi += 1;
+			continue;
+		}
+
+		if (strcmp(argv[argi], "--verbose") == 0 || strcmp(argv[argi], "--debug-decrypt") == 0)
+		{
+			g_verbose = 1;
 			argi += 1;
 			continue;
 		}
